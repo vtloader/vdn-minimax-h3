@@ -129,7 +129,8 @@ class BidirectionalLinearBranch(nn.Module):
                     self._feature_one, tokens, proj, num_frames, frame_size,
                     use_reentrant=False))
             else:
-                outs.append(self._feature_one(tokens, proj, num_frames, frame_size))
+                outs.append(self._feature_one(tokens, proj, num_frames, frame_size,
+                                              heads=heads))
         return tuple(outs)
 
     def _feature_one(self, tokens, proj, num_frames, frame_size, use_conv=True,
@@ -217,8 +218,8 @@ class BidirectionalLinearBranch(nn.Module):
 
     def forward(self, xv, num_frames, tokens_per_frame, bounds, qkv_raw,
                 frame_size=None, skip_ends=False, text_x=None, text_qkv_raw=None,
-                inference=False, heads=None, beta=None, gate=None, frame_mean=None,
-                text_beta=None):
+                inference=False, inference_body=None, heads=None, beta=None, gate=None,
+                frame_mean=None, text_beta=None):
         """Everything the softmax window CANNOT see, summarised for every video token.
 
             0. text chunk (optional)    the prompt -> S_text, the state both scans start
@@ -288,13 +289,24 @@ class BidirectionalLinearBranch(nn.Module):
         # The Ulysses inference case hands in what this rank cannot compute itself
         # (its head range; beta, the output gate and the frame mean, which the sequence
         # owner computed from `xv` before dispatch). Inference-body only, by design.
+        if inference_body not in (None, "fused", "eager"):
+            raise ValueError(f"inference_body must be 'fused' or 'eager', got "
+                             f"{inference_body!r}")
+        if inference_body is not None and not inference:
+            raise ValueError("inference_body is only meaningful with inference=True")
         sharded = dict(heads=heads, beta=beta, gate=gate, frame_mean=frame_mean,
                        text_beta=text_beta)
         if any(v is not None for v in sharded.values()) and not inference:
             raise ValueError("heads/beta/gate/frame_mean/text_beta are inference-only "
                              "(the training body derives them from xv)")
-        run_readout = ((lambda *a: self._readout_inference(*a, **sharded))
-                       if inference else self._readout)
+        if not inference:
+            run_readout = self._readout
+        elif inference_body == "eager":
+            # Ascend: the CUDA Triton/Inductor inference body is unavailable, so run the
+            # single-NPU eager `_readout` arithmetic on this rank's head range.
+            run_readout = lambda *a: self._readout(*a, **sharded)
+        else:
+            run_readout = lambda *a: self._readout_inference(*a, **sharded)
         n_heads = self.num_heads if heads is None else heads.stop - heads.start
         ref = xv if xv is not None else gate      # dtype/device for the empty rows
 
@@ -324,7 +336,8 @@ class BidirectionalLinearBranch(nn.Module):
         return out
 
     def _readout(self, xv, num_frames, tokens_per_frame, bounds, qkv_raw,
-                 frame_size=None, text_x=None, text_qkv_raw=None):
+                 frame_size=None, text_x=None, text_qkv_raw=None, heads=None,
+                 beta=None, gate=None, frame_mean=None, text_beta=None):
         """The branch algorithm itself, over exactly the frames it owns.
 
         NO skip_ends parameter, on purpose: this function has no notion of anchors, and
@@ -336,19 +349,33 @@ class BidirectionalLinearBranch(nn.Module):
         Keeping the prune and the scatter next to each other in `forward` also means an
         early return added to the algorithm cannot skip the scatter and leave the two
         anchor frames holding garbage instead of zero.
+
+        HEAD-SLICED INFERENCE (Ascend Ulysses): `heads` and the pre-dispatch `beta` /
+        `gate` / `frame_mean` / `text_beta` make this same eager arithmetic run on one
+        rank's head range. It is the NPU counterpart of `_readout_inference`'s head slice:
+        no CUDA Triton/Inductor kernels, and the arithmetic is the single-NPU body.
         """
+        n_heads = self.num_heads if heads is None else heads.stop - heads.start
         num_tokens = num_frames * tokens_per_frame
-        heads, head_dim = self.num_heads, self.head_dim
+        head_dim = self.head_dim
+        if heads is not None and xv is None and any(
+                v is None for v in (beta, gate, frame_mean)):
+            raise ValueError("a head-sliced eager readout needs beta, gate and frame_mean "
+                             "(the sequence owner computes them from xv)")
         backend = self._delta_backend("backend", tokens_per_frame)
-        shape_per_frame = (num_frames, tokens_per_frame, heads, head_dim)
+        shape_per_frame = (num_frames, tokens_per_frame, n_heads, head_dim)
 
         # --- 1. features ------------------------------------------------------------
-        query, key, value = self._features(qkv_raw, num_frames, frame_size)  # [F*S, H, d]
+        query, key, value = self._features(qkv_raw, num_frames, frame_size,
+                                           heads=heads)                  # [F*S, H, d]
         query_by_frame = query.view(shape_per_frame)                     # [F, S, H, d]
         key_by_frame = key.view(shape_per_frame).permute(0, 2, 1, 3)     # [F, H, S, d]
         value_by_frame = value.view(shape_per_frame).permute(0, 2, 1, 3)
-        beta = torch.sigmoid(self.beta_proj(xv))                         # [F*S, H]
-        beta = beta.view(num_frames, tokens_per_frame, heads).permute(0, 2, 1)  # [F,H,S]
+        if beta is None:
+            beta = torch.sigmoid(self.beta_proj(xv))                     # [F*S, H]
+            if heads is not None:
+                beta = beta[:, heads]
+        beta = beta.view(num_frames, tokens_per_frame, n_heads).permute(0, 2, 1)  # [F,H,S]
 
         # --- 2. collapse each frame's S tokens into two d x d matrices ---------------
         A, B = frame_statistics(key_by_frame, value_by_frame, beta,
@@ -357,25 +384,31 @@ class BidirectionalLinearBranch(nn.Module):
         # dtype=fp32 on the mean, not just inside alpha: xv is bf16, so without it the
         # frame mean is rounded to bf16 BEFORE reaching the fp32 island, and `.float()`
         # in there cannot recover what the mean already threw away.
-        alpha = self.alpha(xv.view(num_frames, tokens_per_frame, -1)
-                           .mean(dim=1, dtype=torch.float32))
+        if frame_mean is None:
+            frame_mean = xv.view(num_frames, tokens_per_frame, -1).mean(
+                dim=1, dtype=torch.float32)
+        alpha = self.alpha(frame_mean, heads=heads)
 
         # --- 0/3. scans: prefix_states[t] = frames 0..t, suffix_states[t] = frames t..F-1
         # Seeded with half the text state when the prompt was handed in, so both
         # directions start from the prompt rather than from nothing.
-        text_state = self._text_state(text_x, text_qkv_raw)
+        text_state = self._text_state(text_x, text_qkv_raw, heads=heads,
+                                      text_beta=text_beta)
         prefix_states, suffix_states = _run_scans(backend, alpha, A, B,
                                                   text_state=text_state)
 
         # --- 4. boundary gather: the complement of the softmax window, brought to t
+        out_dtype = xv.dtype if xv is not None else gate.dtype
         linear_state = gather_linear_state(prefix_states, suffix_states, alpha, bounds,
-                                     bridge=self.bridge, text_state=text_state).to(xv.dtype)
+                                     bridge=self.bridge, text_state=text_state).to(out_dtype)
 
         # --- 5. read out with the query, then normalise and gate ---------------------
         readout = torch.einsum("fhvk,fshk->fshv", linear_state, query_by_frame)
 
-        readout = self.norm(readout.reshape(num_tokens, heads, head_dim))
-        return (readout * self.output_gate(xv)).reshape(num_tokens, heads * head_dim)
+        if gate is None:
+            gate = self.output_gate(xv)
+        readout = self.norm(readout.reshape(num_tokens, n_heads, head_dim))
+        return (readout * gate).reshape(num_tokens, n_heads * head_dim)
 
     def _readout_inference(self, xv, num_frames, tokens_per_frame, bounds, qkv_raw,
                            frame_size=None, text_x=None, text_qkv_raw=None, heads=None,

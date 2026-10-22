@@ -320,6 +320,7 @@ _GATHER_INDEX_CACHE = collections.OrderedDict()
 _GATHER_CACHE = {}
 
 
+@torch.inference_mode(False)
 def _gather_indices(bounds, num_frames, device):
     """The index tensors `_gather_body` needs, built once per (bounds, F, device):
     rebuilding them per call would be two host-to-device copies per layer per
@@ -380,10 +381,13 @@ def _gather_body(prefix_states, suffix_states, alpha, text_state, bridge_alpha, 
         # that is [0..t] (prefix row 0), from virtual F it is [t..F-1] (prefix row F,
         # which exists -- the bank has F+1 rows). Clamping both the same way would have
         # decayed the text state over one frame too few.
-        alpha_from_before = torch.exp(log_alpha_prefix[frames + 1]
+        # `frames` is arange(num_frames), so rows frames+1 and frames are the two
+        # full-range slices -- indexing with the arange would gather the same rows
+        # into a fresh copy for no reason.
+        alpha_from_before = torch.exp(log_alpha_prefix[1:]
                                       - log_alpha_prefix[bridge_before])    # [F,H,d]
         alpha_from_after = torch.exp(log_alpha_prefix[bridge_after]
-                                     - log_alpha_prefix[frames])            # [F,H,d]
+                                     - log_alpha_prefix[:-1])               # [F,H,d]
         # alpha is per KEY channel: unsqueeze(2) broadcasts it over d_v, not d_k
         state_before = state_before * alpha_from_before.unsqueeze(2)
         state_after = state_after * alpha_from_after.unsqueeze(2)
@@ -394,5 +398,4 @@ def _gather_body(prefix_states, suffix_states, alpha, text_state, bridge_alpha, 
         out = (state_before * has_before.view(-1, 1, 1, 1)
                + state_after * has_after.view(-1, 1, 1, 1))
     return out if out_dtype is None else out.to(out_dtype)
-
 

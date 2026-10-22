@@ -94,6 +94,56 @@ def merge_lora_state(model, state, scale=1.0):
     return merged
 
 
+def merge_lora_state_npu(model, state, scale=1.0, delta_device="npu"):
+    """Fold peft LoRA pairs into an already TP-sharded model on its device.
+
+    This is the device-side counterpart of ``merge_lora_state``.  TP replaces
+    projections with ``ColumnLinear``/``RowLinear`` shards, so the full ``B @ A``
+    delta cannot be added directly:
+
+    - ColumnLinear: output rows are sharded -> use ``B[rows] @ A``.
+    - RowLinear: input columns are sharded -> use ``B @ A[:, columns]``.
+    - replicated modules: the full delta.
+
+    The arithmetic is the same as ``merge_lora_state`` except that the FP32
+    ``B @ A`` runs on the NPU; BF16 results can differ from CPU at a few ULPs.  It is
+    intended for the explicit non-bitwise ``off`` path, not the parity modes.
+    """
+    from src.inference.utils.tensor_parallel import ColumnLinear, RowLinear
+
+    params = dict(model.named_parameters())
+    modules = dict(model.named_modules())
+    merged = 0
+    with torch.no_grad():
+        for name, a in state.items():
+            if ".lora_A." not in name:
+                continue
+            b = state[name.replace(".lora_A.", ".lora_B.")]
+            target = name.split(".lora_A.")[0] + ".weight"
+            w = _resolve(params, target)
+            module_name = target.rsplit(".", 1)[0]
+            module = modules.get(module_name)
+            a = a.to(dtype=torch.float32)
+            b = b.to(dtype=torch.float32)
+            if isinstance(module, ColumnLinear):
+                b = b[module.rows]
+            elif isinstance(module, RowLinear):
+                a = a[:, module.columns]
+            if delta_device == "cpu":
+                # Keep the FP32 delta exactly as the CPU merge computes it, then
+                # apply the BF16 update on the NPU. This removes the device
+                # matmul-order drift while retaining the NPU weight update.
+                delta = (b @ a) * scale
+                w.data.add_(delta.to(dtype=w.dtype).to(w.device))
+            elif delta_device == "npu":
+                delta = (b.to(w.device) @ a.to(w.device)) * scale
+                w.data.add_(delta.to(dtype=w.dtype))
+            else:
+                raise ValueError(f"delta_device must be 'npu' or 'cpu', got {delta_device!r}")
+            merged += 1
+    return merged
+
+
 def load_external_lora(path, alpha=None):
     """Read a community LoRA safetensors -> (state, scale, rank). The peft `.default.`
     adapter infix is stripped; `alpha` overrides the file metadata when given."""

@@ -66,6 +66,9 @@ from src.training.turbo_adapter import (copy_adapter_state, extra_shard_module_p
 from src.utils import run_lock
 from src.utils.distributed import broadcast_and_verify_init
 from src.utils.lr_schedule import lr_at
+from src.utils.device import (distributed_backend, empty_cache, local_device,
+                              max_memory_allocated, reset_peak_memory_stats,
+                              set_device, set_memory_fraction)
 
 STAGE = "d"
 WEIGHTS_PREFIX = "hybrid_turbo_lora_step"
@@ -159,12 +162,11 @@ def run(cfg):
     final_path = os.path.join(output_dir, f"{WEIGHTS_PREFIX}{max_steps:06d}.pt")
     fs.refuse_if_guarded(output_dir, final_path, cfg.training.ignore_stopped)
 
-    dist.init_process_group("nccl")
+    device = local_device()
+    set_device(device)
+    dist.init_process_group(distributed_backend(device))
     rank, world = dist.get_rank(), dist.get_world_size()
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    device = f"cuda:{local_rank}"
-    torch.cuda.set_per_process_memory_fraction(cfg.distributed.memory_fraction)
+    set_memory_fraction(cfg.distributed.memory_fraction, device)
     torch.manual_seed(cfg.training.seed)   # same-seed init on every rank (fake's lora_A)
 
     seed_artifact = fs.load_seed_artifact(cfg.initialization.checkpoint)
@@ -175,7 +177,7 @@ def run(cfg):
 
     model = build_model(source_model_spec, device="cpu",
                         base_source=cfg.initialization.base_source)
-    set_softmax_backend(model, cfg.runtime.kernels.softmax_backend)
+    set_softmax_backend(model, cfg.runtime.kernels.softmax_backend, device=device)
     transform_weights = {name: tensor for name, tensor in seed_artifact.weights.items()
                          if not is_lora(name)}
     loaded_transforms = load_model_weights(model, transform_weights)
@@ -262,7 +264,7 @@ def run(cfg):
         activation_checkpointing=cfg.distributed.activation_checkpointing,
         extra_module_paths=extra_shards)
     gc.collect()
-    torch.cuda.empty_cache()
+    empty_cache(device)
     roles.set(dmd.GENERATOR)
 
     optimizer_groups = fs.build_param_groups(model, [
@@ -389,7 +391,7 @@ def run(cfg):
             turn = dmd.turn(fake_step, warmup_target, updates_per_step)
             generator_turn = turn == dmd.GENERATOR_TURN
             fs.phase_reset()
-            torch.cuda.reset_peak_memory_stats()
+            reset_peak_memory_stats(device)
             metrics = {key: 0.0 for key in _METRIC_KEYS}
 
             with phase("data"):
@@ -407,7 +409,7 @@ def run(cfg):
             with phase("rollout"):
                 video_rows, audio_rows = dmd.rollout(
                     model, roles, schedule, packed, video_rows, audio_rows, index)
-                torch.cuda.empty_cache()
+                empty_cache(device)
             metrics["rollout_index"] = float(index)
 
             with phase("generator_fwd"):
@@ -415,7 +417,7 @@ def run(cfg):
                     model, roles, schedule, packed, video_rows, audio_rows, index,
                     offload, build_graph=generator_turn)
                 if not generator_turn:
-                    torch.cuda.empty_cache()
+                    empty_cache(device)
 
             if generator_turn:
                 t_v, t_a, u = sample_paired_timesteps(timestep_generator, u_min, u_max,
@@ -469,7 +471,7 @@ def run(cfg):
             lr_gen, lr_fake = set_learning_rates(step, fake_step)
             if rank == 0:
                 elapsed = time.time() - t_log
-                peak = torch.cuda.max_memory_allocated() / 2**30
+                peak = max_memory_allocated(device) / 2**30
                 row = {key: round(float(value), 6) for key, value in zip(_METRIC_KEYS, avg)}
                 row.update(step=step, fake_step=fake_step, iteration=iteration, turn=turn,
                            lr=lr_gen, lr_fake=lr_fake, s_per_step=round(elapsed, 2),

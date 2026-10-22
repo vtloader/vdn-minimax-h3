@@ -78,6 +78,8 @@ def fast_ff_forward(self, hidden_states):
     the activation is fused with its quantisation instead, so the bf16 [T, 14336]
     intermediate is never written. Same non-bitwise caveat as everything else in this
     file."""
+    if not hidden_states.is_cuda:
+        return type(self).forward(self, hidden_states)
     swiglu, _, down = self.net
     shape = hidden_states.shape
     h = swiglu.proj(hidden_states.reshape(-1, shape[-1]))
@@ -97,6 +99,9 @@ def fast_block_forward(self, hidden_states, temb, adaln_indices, rotary_emb,
     Line for line the same as the original; only the two pointwise stretches around each
     sub-layer are handed to one kernel instead of four.
     """
+    if not hidden_states.is_cuda:
+        return type(self).forward(self, hidden_states, temb, adaln_indices, rotary_emb,
+                                  attention_mask)
     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(temb)
     pre, post = _compiled("pre", _pre_ref), _compiled("post", _post_ref)
 

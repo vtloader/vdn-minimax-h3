@@ -171,8 +171,8 @@ def score_x0(model, roles, role, packed, x_v, x_a, t_v, t_a):
     finally:
         if previous is not None:
             roles.set(previous)
-        if x_v.is_cuda:
-            torch.cuda.empty_cache()
+        from src.utils.device import empty_cache
+        empty_cache(x_v.device)
     return x0_v, x0_a
 
 

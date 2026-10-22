@@ -50,7 +50,7 @@ def _window_softmax_branch(self, query, key, value, layout, bounds, scale):
     (kernels.softmax_backend, inference-only decomposition). The decomposition is
     head-count-agnostic, so Ulysses shards ([T, heads_per_rank, d] strided views of
     the packed buffer) go through unchanged."""
-    if self._window_kernel(self.inference_mode, query.is_cuda) == "decomposed":
+    if self._window_kernel(self.inference_mode, query.device) == "decomposed":
         from src.models.softmax_attention.decomposed import window_softmax_decomposed
         return window_softmax_decomposed(query, key, value, layout, bounds, scale,
                                          anchor_frames=self.anchor_frames)
@@ -76,6 +76,12 @@ def _linear_branch_shard(attn, raw_qkv, beta, gate, frame_mean, first_head, last
     layout = attn.layout
     branch = attn.linear_attention
     heads = slice(first_head, last_head)
+    # Ascend has no CUDA Triton/Inductor kernels.  The fused inference body would either
+    # fail there or fall back to torch.compile (which is not the production arithmetic on
+    # NPU); the head-sliced eager body is the single-NPU `_readout` arithmetic verbatim.
+    inference_body = (
+        "eager" if attn._ulysses_runtime.device.type == "npu" else "fused"
+    )
     out = gate.new_zeros(layout.seq_len, last_head - first_head, branch.head_dim)
 
     video = slice(layout.video_start, layout.video_end)
@@ -91,8 +97,8 @@ def _linear_branch_shard(attn, raw_qkv, beta, gate, frame_mean, first_head, last
         frame_size=(layout.frame_size if branch.short_conv is not None else None),
         skip_ends=attn.anchor_frames == "both",
         text_qkv_raw=text_raw,
-        inference=True, heads=heads, beta=beta[video], gate=gate[video],
-        frame_mean=frame_mean, text_beta=text_beta,
+        inference=True, inference_body=inference_body, heads=heads, beta=beta[video],
+        gate=gate[video], frame_mean=frame_mean, text_beta=text_beta,
     )
     out[video] = readout.view(-1, last_head - first_head, branch.head_dim)
     return out
@@ -150,15 +156,23 @@ def _ulysses_attention_forward(self, hidden_states, rotary_emb=None, attention_m
     full_cover = all(lo <= 0 and hi >= layout.num_frames - 1 for lo, hi in bounds)
     scale = self.head_dim**-0.5
     if full_cover:
-        softmax_out = dispatch_attention_fn(
-            query.unsqueeze(0),
-            key.unsqueeze(0),
-            value.unsqueeze(0),
-            attn_mask=None,
-            dropout_p=0.0,
-            is_causal=False,
-            backend=getattr(type(self.orig.processor), "_attention_backend", None),
-        ).squeeze(0)
+        if x.device.type == "npu":
+            softmax_out = F.scaled_dot_product_attention(
+                query.transpose(0, 1).unsqueeze(0),
+                key.transpose(0, 1).unsqueeze(0),
+                value.transpose(0, 1).unsqueeze(0),
+                scale=scale,
+            ).squeeze(0).transpose(0, 1)
+        else:
+            softmax_out = dispatch_attention_fn(
+                query.unsqueeze(0),
+                key.unsqueeze(0),
+                value.unsqueeze(0),
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=False,
+                backend=getattr(type(self.orig.processor), "_attention_backend", None),
+            ).squeeze(0)
         linear_active = False
     elif self.softmax_impl in ("flex", "decomposed") and x.is_cuda:
         softmax_out = _window_softmax_branch(
@@ -208,6 +222,29 @@ def _ulysses_attention_forward(self, hidden_states, rotary_emb=None, attention_m
                 linear_local[is_video].reshape(int(is_video.sum().item()), -1).type_as(x)
             )
     return out.unsqueeze(0)
+
+
+def _npu_attention_forward(self, hidden_states, rotary_emb=None, attention_mask=None):
+    """Correctness-first multi-NPU attention path.
+
+    HCCL shards the residual stream so each rank can hold a part of the packed
+    sequence.  The CUDA Ulysses path then exchanges QKV heads and runs fused kernels.
+    Ascend has no equivalent Triton pack kernel in this repository, so each NPU gathers
+    the packed sequence, executes the eager HybridAttention once, and returns its local
+    rows. This keeps multi-NPU execution correct while leaving the CUDA Ulysses route
+    unchanged.
+    """
+    if attention_mask is not None:
+        raise ValueError("NPU Ulysses does not accept an attention mask")
+    if hidden_states.shape[0] != 1:
+        raise ValueError("NPU Ulysses inference assumes batch size 1")
+    runtime: UlyssesRuntime = self._ulysses_runtime
+    x_local = hidden_states[0]
+    x = runtime.gather_sequence(x_local)
+    rotary = (tuple(runtime.gather_sequence(part) for part in rotary_emb)
+              if rotary_emb is not None else None)
+    out = self._hybrid_forward(x, rotary)
+    return out[runtime.local_start:runtime.local_end].unsqueeze(0)
 
 
 def _branch_parallel_attention_forward(
@@ -408,7 +445,9 @@ def _ulysses_transformer_forward(
     sequence_length = position_ids.shape[0]
     first_attn = next(iter_hybrids(self))
     runtime.configure(sequence_length, first_attn.num_heads)
-    rotary_emb = self.rope(position_ids)
+    rope_device = self.rope.inv_freq.device
+    rotary_emb = self.rope(position_ids.to(rope_device))
+    rotary_emb = tuple(part.to(hidden_states.device) for part in rotary_emb)
 
     video_embeds = self.proj_in(hidden_states.to(get_parameter_dtype(self.proj_in)))
     audio_embeds = self.audio_proj_in(
@@ -448,19 +487,45 @@ def install_ulysses(
     runtime: UlyssesRuntime,
     *,
     softmax_ranks: int | None = None,
+    npu_head_parallel: bool = False,
 ) -> None:
     """Install Ulysses only on this already-built inference model instance.
 
     ``softmax_ranks`` (config ``parallel.softmax_ranks``): None/0 = standard Ulysses,
     every rank owns heads of both branches; n = branch-parallel, n softmax ranks plus
-    (world - n) linear ranks -- 6+2 on eight GPUs is the shipped layout."""
+    (world - n) linear ranks -- 6+2 on eight GPUs is the shipped layout.
+
+    ``npu_head_parallel`` (config ``parallel.npu_head_parallel``): NPU-only opt-in that
+    selects the standard Ulysses head-parallel forward (HCCL all-to-all QKV, head-sharded
+    softmax and eager far branch) instead of the sequence-gather fallback. It requires
+    2+ ranks and heads divisible by the world size; anything else is a hard error rather
+    than a silent fallback. False keeps the existing NPU behaviour."""
     hybrids = list(iter_hybrids(model))
     if not hybrids:
         raise ValueError("Ulysses path currently requires a HybridAttention checkpoint")
     heads = hybrids[0].num_heads
-    if softmax_ranks:
+    if npu_head_parallel and runtime.device.type != "npu":
+        raise ValueError("parallel.npu_head_parallel is NPU-only; on CUDA select the "
+                         "Ulysses layout with parallel.softmax_ranks")
+    if runtime.device.type == "npu":
+        # Branch-parallel head packing is a CUDA/Triton optimization and is not used.
+        # The fallback gathers the sequence and runs the eager branch on every rank;
+        # npu_head_parallel instead keeps the standard head-sharded Ulysses path.
+        runtime.softmax_ranks = 0
+        if npu_head_parallel:
+            if runtime.world_size < 2:
+                raise ValueError("parallel.npu_head_parallel requires 2+ NPU ranks")
+            if heads % runtime.world_size:
+                raise ValueError(
+                    f"parallel.npu_head_parallel needs the {heads} attention heads "
+                    f"divisible by {runtime.world_size} ranks"
+                )
+            runtime.npu_head_parallel = True
+            runtime.num_heads = heads
+            runtime.heads_per_rank = heads // runtime.world_size
+    elif softmax_ranks:
         runtime.enable_branch_parallel(softmax_ranks)
-    if heads % runtime.world_size:
+    if runtime.device.type != "npu" and heads % runtime.world_size:
         raise ValueError(f"{heads} attention heads are not divisible by {runtime.world_size} ranks")
     for attn in hybrids:
         if attn.num_heads != heads:
@@ -470,7 +535,12 @@ def install_ulysses(
                 "the inference Ulysses pack currently requires linear_head_dim == attention head_dim"
             )
         attn._ulysses_runtime = runtime
-        if runtime.branch_parallel:
+        if runtime.device.type == "npu":
+            attention_forward = (
+                _ulysses_attention_forward if runtime.npu_head_parallel
+                else _npu_attention_forward
+            )
+        elif runtime.branch_parallel:
             attention_forward = _branch_parallel_attention_forward
         else:
             attention_forward = _ulysses_attention_forward

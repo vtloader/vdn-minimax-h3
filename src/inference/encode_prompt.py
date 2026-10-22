@@ -1,12 +1,14 @@
 """Encode t2va prompts with the Qwen3-VL conditioner and cache the results.
 
 Replicates `MiniMaxH3TextEncoderStep` exactly: the prompt verbatim, no chat template, no
-special tokens, hidden state after decoder layer 50, tags all text. Run once on one GPU;
+special tokens, hidden state after decoder layer 50, tags all text. Run once on one GPU/NPU;
 inference then reuses the cached file and never loads the 62 GB conditioner again.
 
     python src/inference/encode_prompt.py --prompt "..." --out prompts/my_prompt.pt
     python src/inference/encode_prompt.py --jsonl prompts.jsonl --take 4 \
         --out_dir prompts --name prompt
+    python src/inference/encode_prompt.py --prompt "..." --out prompts/my_prompt.pt \
+        --device npu:1 --offload
 
 The batch form exists because loading the conditioner costs far more than encoding: four
 separate --prompt runs would pay the 62 GB load four times. It also keeps a prompt set
@@ -17,17 +19,23 @@ command line.
 import argparse
 import json
 import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import torch
 from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 
 from src.paths import upstream_snapshot
+from src.utils.device import device_of, set_device
+
 TEXT_ENCODER_LAYER = 50
 TEXT_TAG = 1
 
 
 def encode(processor, text_encoder, prompt, out, device):
     token_ids = processor.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    print(f"Encoding {len(token_ids)} text tokens on {device} -> {out}", flush=True)
     input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
     mm_token_type_ids = torch.tensor(
         processor.create_mm_token_type_ids([token_ids]), dtype=torch.long, device=device
@@ -53,7 +61,7 @@ def encode(processor, text_encoder, prompt, out, device):
 
 
 def main():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description="Cache Qwen3-VL text conditioning on CUDA or NPU.")
     p.add_argument("--prompt", type=str)
     p.add_argument("--out", type=str)
     p.add_argument("--jsonl", type=str,
@@ -70,19 +78,38 @@ def main():
     p.add_argument("--model_root", type=str, default=None,
                    help="a MiniMax-H3 snapshot with processor/ and text_encoder/; "
                         "default: downloaded from the Hub on first use")
-    p.add_argument("--device", type=str, default="cuda:0")
+    p.add_argument("--device", type=str, default="cuda:0",
+                   help="encoding device, e.g. cuda:0 or npu:1")
+    p.add_argument("--offload", action="store_true",
+                   help="keep encoder weights on CPU and move leaf modules to --device "
+                        "only while encoding (lower accelerator memory, slower; no stream prefetch)")
     args = p.parse_args()
     if not args.jsonl and not (args.prompt and args.out):
         p.error("pass --jsonl, or both --prompt and --out")
 
+    device = device_of(args.device)
+    set_device(device)
     if args.model_root is None:
+        print("Resolving processor and text encoder snapshot", flush=True)
         args.model_root = upstream_snapshot("processor", "text_encoder")
 
+    print(f"Loading processor from {args.model_root}", flush=True)
     processor = Qwen3VLProcessor.from_pretrained(args.model_root, subfolder="processor")
+    print(f"Loading text encoder ({'CPU leaf offload' if args.offload else device})", flush=True)
     text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
         args.model_root, subfolder="text_encoder", dtype=torch.bfloat16
-    ).to(args.device)
+    )
     text_encoder.eval().requires_grad_(False)
+    if args.offload:
+        from diffusers.hooks import apply_group_offloading
+
+        # Encoding calls the inner model directly, bypassing the outer LM forward.
+        apply_group_offloading(
+            text_encoder.model, onload_device=device, offload_device="cpu",
+            offload_type="leaf_level", use_stream=False,
+        )
+    else:
+        text_encoder.to(device)
 
     if args.jsonl:
         with open(args.jsonl) as f:
@@ -91,9 +118,9 @@ def main():
                   else [(i, all_rows[i]) for i in args.rows])
         for i, r in picked:
             encode(processor, text_encoder, r["prompt"],
-                   os.path.join(args.out_dir, f"{args.name}_{i}.pt"), args.device)
+                   os.path.join(args.out_dir, f"{args.name}_{i}.pt"), device)
     else:
-        encode(processor, text_encoder, args.prompt, args.out, args.device)
+        encode(processor, text_encoder, args.prompt, args.out, device)
 
 
 if __name__ == "__main__":

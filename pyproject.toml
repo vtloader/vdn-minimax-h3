@@ -4,27 +4,37 @@ version = "0.1.0"
 description = "MiniMax-H3 with hybrid window-softmax / linear attention: inference and the Stage A-D trainers"
 readme = "README.md"
 license = { file = "LICENSE" }   # Apache-2.0, the code only; the weights carry the MiniMax H3 agreement
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.11,<3.13"
 dependencies = [
-    # torch and diffusers are NOT listed: torch is installed first from the cu129 index
-    # (flash-attn-4's dependency tree would otherwise pull the PyPI default, cu130) and
+    # torch and diffusers are NOT listed: install the device-specific Torch first, and
     # diffusers is the patched tree in ./diffusers, installed editable before this (README).
-    "triton==3.7.1",
-    "flash-attn-4==4.0.0b26",     # flash_attn.cute -- the FA4 CuTe kernels behind FlexAttention
     "transformers==5.15.0",
     "accelerate==1.14.0",
-    "torchao==0.18.0",            # fp8 on the diffusers path (infer_diffusers.py --fp8)
     "peft==0.20.0",
     "safetensors==0.8.0",
     "huggingface_hub>=1.27.0",
     "omegaconf==2.3.1",
     "pyyaml==6.0.3",
     "einops==0.8.2",
-    "numpy==2.5.2",
+    "numpy>=1.26,<3",
     "pillow==12.3.0",
-    "torchvision==0.28.0",        # Qwen3-VL's processor needs it (src/inference/encode_prompt.py)
     "av==18.1.0",                 # mp4 muxing (diffusers.utils.export_utils.encode_video)
     "tqdm",
+]
+
+[project.optional-dependencies]
+# CUDA keeps the original optimized route: Triton, FlashAttention 4 and TorchAO.
+cuda = [
+    "numpy==2.5.2",
+    "triton==3.7.1",
+    "flash-attn-4==4.0.0b26",
+    "torchao==0.18.0",
+    "torchvision==0.28.0",
+]
+# Ascend uses the preinstalled torch/torch_npu pair.  The matching torchvision wheel is
+# selected here because torchvision is imported by Qwen3-VL's processor.
+npu = [
+    "torchvision==0.22.1",
 ]
 
 [tool.setuptools]

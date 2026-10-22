@@ -45,6 +45,10 @@ from src.models.hybrid_transform import (hybrid_new_parameters, iter_hybrids, se
 from src.utils.lr_classes import lr_class_map
 from src.training.t2va_batch import pack_noisy_batch
 from src.utils import run_lock
+from src.utils.device import (autocast, distributed_backend, local_device,
+                              max_memory_allocated, memory_allocated,
+                              reset_peak_memory_stats, set_device,
+                              set_memory_fraction)
 
 
 class AlignHook:
@@ -73,7 +77,7 @@ class AlignHook:
         teacher = output.detach()[0]                               # [S, hidden] bf16
         teacher_sq = teacher.float().pow(2).sum().clamp_min(1e-30)
         with torch.enable_grad():
-            with torch.autocast("cuda", torch.bfloat16):
+            with autocast(x.device, dtype=torch.bfloat16):
                 student = self.hybrid._hybrid_forward(x[0], rotary_emb)
             diff = student.float() - teacher.float()
             del student
@@ -90,8 +94,9 @@ class AlignHook:
         self.loss = mse.detach()
         self.rel = loss.detach().sqrt()
         if os.environ.get("H3_DEBUG_MEM") and dist.get_rank() == 0:
-            print(f"    block {self.index:2d}: alloc={torch.cuda.memory_allocated()/2**30:.1f}"
-                  f" peak={torch.cuda.max_memory_allocated()/2**30:.1f}GiB", flush=True)
+            device = x.device
+            print(f"    block {self.index:2d}: alloc={memory_allocated(device)/2**30:.1f}"
+                  f" peak={max_memory_allocated(device)/2**30:.1f}GiB", flush=True)
         return None                                                # trunk keeps teacher
 
 
@@ -107,7 +112,10 @@ def save_weights(per_block, step, cfg, spec_dict, rank,
         for name, p in named:
             names.append(name)
             params.append(p)
-    fingerprint = torch.stack([p.detach().double().sum() for p in params])
+    fingerprint = torch.stack([
+        p.detach().float().sum() if p.device.type == "npu" else p.detach().double().sum()
+        for p in params
+    ])
     reference = fingerprint.clone()
     dist.broadcast(reference, src=0)
     mismatched = (fingerprint != reference).nonzero().flatten().tolist()
@@ -150,18 +158,17 @@ def main():
         os.makedirs(out_dir, exist_ok=True)
         run_lock.acquire(out_dir)
 
-    dist.init_process_group("nccl")
+    device = local_device()
+    set_device(device)
+    dist.init_process_group(distributed_backend(device))
     rank, world = dist.get_rank(), dist.get_world_size()
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    device = f"cuda:{local_rank}"
 
     # A1 runs close to the card's capacity on 141 GB GPUs: each layer's backward
     # recompute transiently holds one projection's conv copies + SiLU/L2Norm saves,
     # and the per-layer fp32 grads accumulate across all 50 blocks by design (the
     # all-reduce + ZeRO-1 step happen after the batch). 0.96 leaves a few GiB for
     # driver/NCCL variance.
-    torch.cuda.set_per_process_memory_fraction(0.96)
+    set_memory_fraction(0.96, device)
 
     # SAME seed on every rank: the branch inits draw from the global RNG, and ranks must
     # agree before broadcast_and_verify_init proves they do. Noise/sigma streams are
@@ -174,7 +181,7 @@ def main():
     spec = resolve_model_spec(cfg.model, dict(base_config))
     spec_dict = spec.to_dict()
     model = build_model(spec, device="cpu", base_source=cfg.model.base.source)
-    set_softmax_backend(model, cfg.runtime.kernels.softmax_backend)
+    set_softmax_backend(model, cfg.runtime.kernels.softmax_backend, device=device)
     model.requires_grad_(False)
     truncated = int(cfg.training.truncate_blocks)
     if truncated:
@@ -182,10 +189,14 @@ def main():
         if rank == 0:
             print(f"SMOKE TEST: truncated to {truncated} blocks -- "
                   "checkpoints will be stamped unusable for real runs", flush=True)
-    if cfg.training.teacher_backend == "flex_fa4":
+    if cfg.training.teacher_backend == "flex_fa4" and device.type == "cuda":
         for module in model.modules():
             if isinstance(module, MiniMaxH3Attention):
                 module.set_processor(FlexFA4Processor())
+    elif cfg.training.teacher_backend == "flex_fa4" and device.type == "npu":
+        if rank == 0:
+            print("teacher_backend=flex_fa4 requested on NPU; using the native "
+                  "Diffusers attention processor", flush=True)
     elif cfg.training.teacher_backend:
         model.set_attention_backend(cfg.training.teacher_backend)
     hybrids = list(iter_hybrids(model))
@@ -354,7 +365,7 @@ def main():
             mse, rel = avg[0], avg[1]
             if rank == 0:
                 dt = time.time() - t_log
-                peak = torch.cuda.max_memory_allocated() / 2**30
+                peak = max_memory_allocated(device) / 2**30
                 worst = int(rel.argmax())
                 print(f"[step {step}/{cfg.training.max_steps}] align_mse={mse.mean():.5f} "
                       f"rel={rel.mean():.4f} (worst block {worst}: {rel[worst]:.4f}) "
@@ -377,7 +388,7 @@ def main():
                         "lr": lr, "s_per_step": round(dt, 2),
                         "peak_gib": round(peak, 2)}) + "\n")
             t_log = time.time()
-            torch.cuda.reset_peak_memory_stats()
+            reset_peak_memory_stats(device)
             periodic = (step % cfg.checkpoint.save_every == 0
                         or step == cfg.training.max_steps)
             if periodic or step in early_saves:

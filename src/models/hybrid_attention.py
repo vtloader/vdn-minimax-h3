@@ -11,6 +11,7 @@ to_out_linear takes nn.Linear's default init. Init-only: any checkpoint overwrit
 weight on load.
 """
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from diffusers.models.attention_dispatch import dispatch_attention_fn
@@ -23,7 +24,8 @@ from src.models.softmax_attention.flex_attention import collect_after_first_flas
 from src.models.softmax_attention import (apply_softmax_gate, build_window_block_mask,
                                           window_bounds, window_softmax_flex,
                                           window_softmax_reference)
-from src.models.softmax_attention.decomposed import window_softmax_decomposed
+from src.models.softmax_attention.decomposed import (window_softmax_decomposed,
+                                                     window_softmax_npu_varlen)
 from src.models.softmax_attention.kernels import _qk_prep
 from src.models.ops.fp8_linear import Fp8Linear, quantize_activation
 from src.checkpoints.key_mapping import ANCHOR_FRAME_MODES
@@ -51,8 +53,9 @@ class HybridAttention(nn.Module):
         (`softmax_attention.{radius,chunk}`, `anchor_frames`,
         `linear_attention.{delta_rule,linear_head_dim,bridge,a_fp32,enable_text_state}`,
         `linear_attention.short_conv.targets` as `short_conv`, `enable_softmax_gate`);
-        `softmax_impl` is the one runtime knob ("flex" | "decomposed" | "ref", set by
-        hybrid_transform.set_softmax_backend) and never enters a spec.
+        `softmax_impl` is the one runtime knob ("flex" | "decomposed" | "ref" |
+        "npu_varlen", set by hybrid_transform.set_softmax_backend) and never enters a
+        spec.
 
         anchor_frames: how frames 0 and F-1 sit in the softmax mask -- "columns" (every
         video query sees all of both frames), "rows" (those two frames' queries see the
@@ -67,7 +70,7 @@ class HybridAttention(nn.Module):
         self.head_dim = orig_attn.head_dim
         self.radius = radius
         self.chunk = chunk           # 0 = frame window ("r<n>"); K = K-frame chunks ("c<n>")
-        self.softmax_impl = softmax_impl                         # "flex" | "decomposed" | "ref"
+        self.softmax_impl = softmax_impl
 
         if anchor_frames not in ANCHOR_FRAME_MODES:
             raise ValueError(f"anchor_frames={anchor_frames!r}; expected one of "
@@ -125,7 +128,7 @@ class HybridAttention(nn.Module):
 
         query_raw, key_raw, value = (t.unflatten(-1, (orig.heads, -1)) for t in qkv)  # [total, H, d]
 
-        if self.inference_mode and rotary_emb is not None:
+        if self.inference_mode and x.is_cuda and rotary_emb is not None:
             query = _qk_prep(query_raw, orig.norm_q.weight, orig.norm_q.eps, *rotary_emb)
             key = _qk_prep(key_raw, orig.norm_k.weight, orig.norm_k.eps, *rotary_emb)
         else:
@@ -152,18 +155,26 @@ class HybridAttention(nn.Module):
 
         return out
 
-    def _window_kernel(self, inference, on_cuda):
+    def _window_kernel(self, inference, device):
         """Which window-softmax kernel this forward runs. `softmax_impl` is the process-wide
         choice (hybrid_transform.set_softmax_backend); the decomposition is inference-only,
-        training keeps the differentiable flex path."""
-        if not on_cuda or self.softmax_impl == "ref":
+        training keeps the differentiable flex path. `npu_varlen` is explicit and NPU-only;
+        CPU and every other non-NPU (and non-CUDA) device use the eager reference."""
+        device_type = device.type if isinstance(device, torch.device) else (
+            str(device).split(":", 1)[0])
+        if self.softmax_impl == "npu_varlen":
+            return "npu_varlen" if device_type == "npu" else "ref"
+        if self.softmax_impl == "ref" or device_type != "cuda":
             return "ref"
         if self.softmax_impl == "decomposed" and inference:
             return "decomposed"
         return "flex"
 
     def _window_softmax(self, query, key, value, layout, bounds, scale, inference):
-        kernel = self._window_kernel(inference, query.is_cuda)
+        kernel = self._window_kernel(inference, query.device)
+        if kernel == "npu_varlen":
+            return window_softmax_npu_varlen(query, key, value, layout, bounds, scale,
+                                             anchor_frames=self.anchor_frames)
         if kernel == "decomposed":
             return window_softmax_decomposed(query, key, value, layout, bounds, scale,
                                              anchor_frames=self.anchor_frames)
@@ -177,13 +188,13 @@ class HybridAttention(nn.Module):
 
     def _hybrid_forward(self, x, rotary_emb):
         layout = self.layout
-        hybrid_inference = self.hybrid_inference_mode or self.inference_mode
+        hybrid_inference = x.is_cuda and (self.hybrid_inference_mode or self.inference_mode)
         bounds = self._bounds(layout) if layout is not None else None
         full_cover = layout is None or all(
             lo <= 0 and hi >= layout.num_frames - 1 for lo, hi in bounds)
         scale = self.head_dim ** -0.5
 
-        if not full_cover and self._window_kernel(hybrid_inference, x.is_cuda) == "flex":
+        if not full_cover and self._window_kernel(hybrid_inference, x.device) == "flex":
             # Built (once; cached) BEFORE the projections exist: torch's create_block_mask
             # materialises ~10 GiB at 89k rows, and here the layer's live set is x alone
             # rather than x plus 7 GiB of raw and roped q/k/v.
@@ -196,18 +207,26 @@ class HybridAttention(nn.Module):
             # two different bf16 attention kernels over ~100k keys differ by far more
             # than the 0.99 gate contributes. Matching the kernel makes the full-cover
             # path exactly the teacher.
-            softmax_out = dispatch_attention_fn(
-                query.unsqueeze(0), key.unsqueeze(0), value.unsqueeze(0),
-                attn_mask=None, dropout_p=0.0, is_causal=False,
-                backend=getattr(type(self.orig.processor), "_attention_backend", None),
-            ).squeeze(0)
+            if x.device.type == "npu":
+                softmax_out = F.scaled_dot_product_attention(
+                    query.transpose(0, 1).unsqueeze(0),
+                    key.transpose(0, 1).unsqueeze(0),
+                    value.transpose(0, 1).unsqueeze(0),
+                    scale=scale,
+                ).squeeze(0).transpose(0, 1)
+            else:
+                softmax_out = dispatch_attention_fn(
+                    query.unsqueeze(0), key.unsqueeze(0), value.unsqueeze(0),
+                    attn_mask=None, dropout_p=0.0, is_causal=False,
+                    backend=getattr(type(self.orig.processor), "_attention_backend", None),
+                ).squeeze(0)
             # nothing lies outside the window, so the linear branch would double count
             linear_active = False
         else:
             softmax_out = self._window_softmax(query, key, value, layout, bounds, scale,
                                                hybrid_inference)
             linear_active = True
-            if self._window_kernel(hybrid_inference, x.is_cuda) == "flex":
+            if self._window_kernel(hybrid_inference, x.device) == "flex":
                 collect_after_first_flash()      # see flex_attention: a one-time gc
 
         # The roped q/k (and the flex output) are dead once the local branch is done;
@@ -216,7 +235,7 @@ class HybridAttention(nn.Module):
         del query, key, value
         if self.enable_softmax_gate:
             flat = apply_softmax_gate(softmax_out, self.softmax_gate(x),
-                                     inference=self.inference_mode)
+                                      inference=self.inference_mode and x.is_cuda)
         else:
             flat = softmax_out.reshape(x.shape[0], -1)
         out = self.orig.to_out[0](flat.type_as(x))

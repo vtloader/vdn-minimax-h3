@@ -57,8 +57,21 @@ uv pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu129
 3. Install the other packages shown in `pyproject.toml`, `flash-attn-4` included (`--prerelease=allow` is needed for its pre-release `nvidia-cutlass-dsl` dependency); on Ampere, Ada and consumer Blackwell neither it nor the regular `flash-attn` is used, as attention there runs on PyTorch's own kernels.
 
 ```bash
-uv pip install --prerelease=allow -e .
+uv pip install --prerelease=allow -e ".[cuda]"
 ```
+
+For Ascend NPU, use the matching `torch`/`torch_npu` installation supplied by CANN and
+install the NPU extra instead. The NPU path uses the reference window attention and
+eager PyTorch kernels; the CUDA extra remains available for the optimized CUDA path.
+
+```bash
+uv pip install -e ".[npu]"
+```
+
+The currently provisioned Ascend environment has been verified with Python 3.11,
+`torch==2.7.1+cpu`, `torch-npu==2.7.1.post4`, and CANN 9.1.0. Official TorchNPU wheels
+also publish Python 3.12 builds; use the Torch/TorchNPU pair matching the installed CANN
+release if a different interpreter is required.
 
 4. Install the patched Diffusers. The setup script handles everything:
 
@@ -183,6 +196,28 @@ python src/inference/infer.py \
   render.out=results/mine.mp4
 ```
 
+On an Ascend NPU, select the NPU device and enable block-level CPU offload when the
+transformer does not fit in one device's HBM:
+
+```bash
+python src/inference/infer.py \
+  --config configs/inference/8nfe.yaml \
+  checkpoint=ckpts/stage-dmd-step-250 \
+  render.device=npu:0 render.offload_dit=true \
+  render.prompt_file=prompts/example_0.pt \
+  render.out=results/npu.mp4
+```
+
+The two-NPU HCCL path uses:
+
+```bash
+.venv/bin/python -m torch.distributed.run --standalone --nproc_per_node=2 \
+  src/inference/infer_ulysses.py --config configs/inference/8nfe_tuned.yaml \
+  checkpoint=ckpts/stage-dmd-step-250 render.device=npu:0 \
+  render.offload_dit=true parallel.softmax_ranks=0 \
+  render.prompt_file=prompts/example_0.pt render.out=results/npu-ulysses.mp4
+```
+
 #### Supporting FL2VA, I2VA, and L2VA
 
 The same checkpoints also generate from keyframes. We provide an FL2VA example in [prompts/image/](prompts/image/):
@@ -290,6 +325,26 @@ bash scripts/inference/8nfe_tuned_fp8.sh                # one GPU
 bash scripts/inference/8nfe_tuned_fp8_ulysses_h200.sh   # eight H200s, one node
 bash scripts/inference/8nfe_tuned_fp8_ulysses_b200.sh   # eight B200s, one node
 ```
+
+### Browser WebUI
+
+The repository includes a small standard-library browser UI for one-device generation.
+It supports T2VA, I2VA, FL2VA, and Ref2VA-like requests, preserves uploaded image names
+under a per-task run directory, and provides a live log page with the generated MP4.
+The UI includes resolution, duration, export FPS, image previews, and accelerated
+8-step / standard 50-step sampling schemes that select their matching checkpoints.
+
+From the repository root, launch it with:
+
+```bash
+bash scripts/launch_webui.sh
+```
+
+The launcher uses `.venv` when present and defaults to `0.0.0.0:3000`. Set `HOST` and
+`PORT` to change the bind address. NPU requests use `configs/inference/8nfe.yaml` and
+default to CPU offload. CUDA FP8 is available only through the explicit optimized CUDA
+option in the form. See [webui/README.md](webui/README.md) for task storage and the
+`WEBUI_DRY_RUN=1` UI smoke mode.
 
 ## Results
 

@@ -257,10 +257,13 @@ class VDNMiniMaxH3Transformer3DModel(MiniMaxH3Transformer3DModel):
         # `render.load_models` asks for; `_keep_in_fp32_modules` still holds back the
         # time embedder. A caller that names a dtype gets that one.
         base = spec["base"]
+        base_source = base["source"]
+        if os.path.isdir(source) and os.path.isdir(os.path.join(source, base["subfolder"])):
+            base_source = source
         if "dtype" not in kwargs and "torch_dtype" not in kwargs:
             kwargs["dtype"] = torch.bfloat16
         model = super().from_pretrained(
-            base["source"], subfolder=base["subfolder"], revision=base.get("revision"),
+            base_source, subfolder=base["subfolder"], revision=base.get("revision"),
             cache_dir=cache_dir, token=token, local_files_only=local_files_only, **kwargs)
 
         apply_hybrid_attention_transform(model, spec["transform"])
@@ -280,7 +283,13 @@ class VDNMiniMaxH3Transformer3DModel(MiniMaxH3Transformer3DModel):
         # wrong, so a caller that means to build a graph can set inference_kernels false.
         if spec.get("inference_kernels", True):
             set_inference_mode(model, True)
-            set_softmax_backend(model, softmax_backend or spec.get("softmax_backend", "flex"))
+            # Models load on CPU before a pipeline moves/offloads them. Each fused
+            # forward dispatches on its input tensor, so moving to NPU stays eager and
+            # moving to CUDA keeps the original optimized path.
+            set_softmax_backend(
+                model,
+                softmax_backend or spec.get("softmax_backend", "flex"),
+            )
 
         # Last, after the merge (see the header), and off unless asked.
         if fp8 or quantization_config is not None:

@@ -138,8 +138,9 @@ class CheckpointConfig:
 
 @dataclass
 class KernelsConfig:
-    softmax_backend: str = "flex"            # flex | decomposed | ref | auto (inference adds
-                                             # auto = per arch); runtime: NEVER enters ModelSpec
+    softmax_backend: str = "flex"            # flex | decomposed | ref | npu_varlen | auto
+                                             # (inference adds auto = per arch; npu_varlen
+                                             # is NPU-only); runtime: NEVER enters ModelSpec
 
 
 @dataclass

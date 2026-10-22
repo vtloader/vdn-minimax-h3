@@ -33,6 +33,9 @@ from src.utils import run_lock
 from src.utils.activation_checkpointing import split_block_checkpoints
 from src.utils.lr_schedule import check_schedule_stamp
 from src.utils.samplers import SkipFirst
+from src.utils.device import (device_of, empty_cache, get_rng_state,
+                              local_device, memory_allocated, memory_reserved,
+                              set_rng_state, synchronize)
 
 
 # ------------------------------------------------------------------------ phase timers
@@ -53,12 +56,12 @@ class phase:
         self.name = name
 
     def __enter__(self):
-        torch.cuda.synchronize()
+        synchronize(local_device())
         self.t0 = time.time()
         return self
 
     def __exit__(self, *exc):
-        torch.cuda.synchronize()
+        synchronize(local_device())
         _PHASE[self.name] = _PHASE.get(self.name, 0.0) + time.time() - self.t0
         return False
 
@@ -113,7 +116,7 @@ def teacher_velocity(model, inputs, adapters=False):
 
         # Hand the teacher pass's blocks back before the student's forward+backward
         # allocates, so the two peaks stay sequential rather than summing.
-        torch.cuda.empty_cache()
+        empty_cache(next(model.parameters()).device)
 
 
 def student_forward(model, inputs, offload_activations):
@@ -204,6 +207,8 @@ def gather_named(model, select, rank):
     trainables are a bug (FSDP should own every one), and every shard participates in
     every full_tensor() -- this is a collective."""
     state, fingerprints, names = {}, [], []
+    model_device = next(model.parameters()).device
+    use_fp32_fingerprint = model_device.type == "npu"
     for name, param in model.named_parameters():
         t = param.data
         if hasattr(t, "full_tensor"):
@@ -214,7 +219,10 @@ def gather_named(model, select, rank):
                 state[name] = t.cpu()                    # the fp32 masters, as trained
         elif param.requires_grad:
             raise RuntimeError(f"trainable {name} is not sharded -- expected DTensor")
-        fingerprints.append(t.detach().double().sum())
+        fingerprints.append(
+            t.detach().float().sum() if use_fp32_fingerprint
+            else t.detach().double().sum()
+        )
         names.append(name)
     fingerprint = torch.stack([f.to(model.device) for f in fingerprints])
     return state, fingerprint, names
@@ -266,8 +274,10 @@ def save_train_state(model, optimizer, weight_names, trainable_names, stage, ste
         state = optimizer.state.get(params[name], {})
         opt_states[name] = {k: (v.full_tensor() if hasattr(v, "full_tensor") else v)
                             for k, v in state.items()}
+    device = next(model.parameters()).device
     rng = {
-        "torch": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state(),
+        "torch": torch.get_rng_state(),
+        device.type: get_rng_state(device),
         "noise_gen": noise_generator.get_state().cpu(),
         "sigma_gen": sigma_generator.get_state(),
     }
@@ -369,7 +379,8 @@ def restore_optimizer_and_rng(resume, model, optimizer, noise_generator, sigma_g
     if full.metadata["world_size"] == world:
         rng = full.rng_state["per_rank"][rank]
         torch.set_rng_state(rng["torch"])
-        torch.cuda.set_rng_state(rng["cuda"])
+        device = next(model.parameters()).device
+        set_rng_state(rng[device.type], device)
         noise_generator.set_state(rng["noise_gen"])
         sigma_generator.set_state(rng["sigma_gen"])
         skip_sampler.skip = resume.in_epoch
@@ -381,10 +392,11 @@ def restore_optimizer_and_rng(resume, model, optimizer, noise_generator, sigma_g
     resume.full_state = None
     del full
     gc.collect()
-    torch.cuda.empty_cache()
+    empty_cache(next(model.parameters()).device)
     if rank == 0:
-        print(f"post-resume: {torch.cuda.memory_allocated()/2**30:.1f} GiB allocated, "
-              f"{torch.cuda.memory_reserved()/2**30:.1f} GiB reserved", flush=True)
+        device = next(model.parameters()).device
+        print(f"post-resume: {memory_allocated(device)/2**30:.1f} GiB allocated, "
+              f"{memory_reserved(device)/2**30:.1f} GiB reserved", flush=True)
     return epoch
 
 
@@ -417,7 +429,7 @@ def shard_model(model, world, shard_size, device, rank, activation_checkpointing
 
     mesh = None
     if world > shard_size:
-        mesh = init_device_mesh("cuda", (world // shard_size, shard_size),
+        mesh = init_device_mesh(device_of(device).type, (world // shard_size, shard_size),
                                 mesh_dim_names=("replicate", "shard"))
         if rank == 0:
             print(f"HSDP mesh: replicate={world // shard_size} x shard={shard_size}",

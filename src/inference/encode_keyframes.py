@@ -28,8 +28,12 @@ carries `reference_size`.
 
     python src/inference/encode_keyframes.py --prompt "..." \\
         --refs ref-1.png ref-2.png --out prompts/mine.pt
+
+Add `--device npu:1 --offload` (or `--device cuda:0 --offload`) to keep the Qwen
+encoder on CPU between leaf-module calls. The VAE still runs on the selected device.
 """
 import argparse
+import gc
 import os
 import sys
 
@@ -38,6 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import numpy as np
 import torch
 from PIL import Image
+from PIL import ImageOps
 from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 
 from diffusers import AutoencoderKLMiniMaxH3
@@ -45,8 +50,10 @@ from diffusers.modular_pipelines.minimax_h3.encoders import encode_vae_condition
 from diffusers.modular_pipelines.minimax_h3.modular_pipeline import resolve_canvas_size
 
 from src.inference.render import PIXEL_MEAN, PIXEL_STD
+from src.inference.geometry import validate_canvas
 from src.inference.utils.prompt_cache import REFERENCE_ANCHOR, conditioning_mode
 from src.paths import H3_BASE, resolve_weights, upstream_snapshot
+from src.utils.device import device_of, empty_cache, set_device
 
 TEXT_ENCODER_LAYER = 50
 VIDEO_TAG, TEXT_TAG = 0, 1
@@ -73,10 +80,14 @@ KEYFRAME_INSTRUCTIONS = {
 }
 
 
-def put_on_canvas(keyframes):
+def put_on_canvas(keyframes, width=None, height=None):
     """MiniMaxH3ResizeStep: the canvas follows the first keyframe's aspect ratio; the
     first keyframe is stretched onto it, every follower cover-cropped (the released
     model's rounding, not VaeImageProcessor's). Returns (keyframes, height, width)."""
+    if width is not None or height is not None:
+        validate_canvas(width, height)
+        return [ImageOps.fit(image.convert("RGB"), (width, height),
+                             method=Image.Resampling.LANCZOS) for image in keyframes], height, width
     height, width = resolve_canvas_size(*keyframes[0].size, CANVAS_MULTIPLE,
                                         CANVAS_SHORT_EDGE, CANVAS_MAX_PIXELS)
     prepared = []
@@ -171,7 +182,7 @@ def check_instruction(prompt, anchors):
 
 
 def main():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description="Cache Qwen3-VL and VAE conditioning for keyframes or references.")
     p.add_argument("--prompt", type=str, required=True)
     p.add_argument("--first", type=str, help="keyframe the video starts from (image path)")
     p.add_argument("--last", type=str, help="keyframe the video ends on (image path)")
@@ -179,18 +190,34 @@ def main():
                    help="reference images in the order the prompt numbers them "
                         "(<Picture 1>, <Picture 2>, ...); a ref2va-like request")
     p.add_argument("--ref_size", type=int, default=REFERENCE_SHORT_EDGE,
-                   help="short edge every reference is put on")
+                    help="short edge every reference is put on")
+    p.add_argument("--width", type=int, default=None,
+                   help="explicit output canvas width, paired with --height; multiples of 32")
+    p.add_argument("--height", type=int, default=None,
+                   help="explicit output canvas height; keyframes are cover-cropped to this canvas")
     p.add_argument("--out", type=str, required=True)
     p.add_argument("--model_root", type=str, default=None,
                    help="a MiniMax-H3 snapshot with processor/ and text_encoder/; "
                         "default: downloaded from the Hub on first use")
     p.add_argument("--vae_root", type=str, default=H3_BASE, help="root holding vae/")
-    p.add_argument("--device", type=str, default="cuda:0")
+    p.add_argument("--device", type=str, default="cuda:0",
+                   help="encoding device, e.g. cuda:0 or npu:1")
+    p.add_argument("--offload", action="store_true",
+                   help="keep Qwen encoder weights on CPU and move leaf modules to --device "
+                        "only while encoding (slower; no stream prefetch); VAE stays on --device")
     args = p.parse_args()
+    if args.width is not None or args.height is not None:
+        try:
+            validate_canvas(args.width, args.height)
+        except ValueError as exc:
+            p.error(str(exc))
     if bool(args.refs) == bool(args.first or args.last):
         p.error("pass --first and/or --last, or --refs (a request with neither is t2va: "
-                "use encode_prompt.py)")
+                 "use encode_prompt.py)")
+    device = device_of(args.device)
+    set_device(device)
     if args.model_root is None:
+        print("Resolving processor and text encoder snapshot", flush=True)
         args.model_root = upstream_snapshot("processor", "text_encoder")
 
     if args.refs:
@@ -199,29 +226,48 @@ def main():
         mode = conditioning_mode(anchors)
         keyframes = normalize_references([Image.open(path) for _, path in pairs], args.ref_size)
         # MiniMaxH3Ref2VASetupStep's canvas: 16:9, whatever the references' shapes.
-        height, width = resolve_canvas_size(16, 9, CANVAS_MULTIPLE, CANVAS_SHORT_EDGE,
-                                            CANVAS_MAX_PIXELS)
+        if args.width is not None:
+            width, height = args.width, args.height
+        else:
+            height, width = resolve_canvas_size(16, 9, CANVAS_MULTIPLE, CANVAS_SHORT_EDGE,
+                                                CANVAS_MAX_PIXELS)
         print(f"{mode}: canvas {width}x{height}; references "
               f"{[f'{k.size[0]}x{k.size[1]}' for k in keyframes]}", flush=True)
     else:
         pairs = [(anchor, path) for anchor, path in (("first", args.first), ("last", args.last)) if path]
         anchors = [anchor for anchor, _ in pairs]
         mode = check_instruction(args.prompt, anchors)
-        keyframes, height, width = put_on_canvas([Image.open(path) for _, path in pairs])
+        canvas_options = {} if args.width is None else {"width": args.width, "height": args.height}
+        keyframes, height, width = put_on_canvas([Image.open(path) for _, path in pairs], **canvas_options)
         print(f"{mode}: canvas {width}x{height}; keyframes {anchors}", flush=True)
-    device = args.device
-
+    print(f"Loading processor from {args.model_root}", flush=True)
     processor = Qwen3VLProcessor.from_pretrained(args.model_root, subfolder="processor")
     token_ids, token_tags, vision_inputs = build_presentation(processor, args.prompt, keyframes)
+    print(f"Loading text encoder ({'CPU leaf offload' if args.offload else device})", flush=True)
     text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
-        args.model_root, subfolder="text_encoder", dtype=torch.bfloat16).to(device)
+        args.model_root, subfolder="text_encoder", dtype=torch.bfloat16)
     text_encoder.eval().requires_grad_(False)
-    prompt_embeds = qwen3vl_prompt_embeds(text_encoder, processor, token_ids, vision_inputs, device)
-    del text_encoder
-    torch.cuda.empty_cache()
+    if args.offload:
+        from diffusers.hooks import apply_group_offloading
 
+        # Encoding calls the inner model directly, bypassing the outer LM forward.
+        apply_group_offloading(
+            text_encoder.model, onload_device=device, offload_device="cpu",
+            offload_type="leaf_level", use_stream=False,
+        )
+    else:
+        text_encoder.to(device)
+    print(f"Encoding {len(token_ids)} text/vision tokens on {device}", flush=True)
+    prompt_embeds = qwen3vl_prompt_embeds(text_encoder, processor, token_ids, vision_inputs, device)
+    print("Releasing text encoder before VAE encoding", flush=True)
+    del text_encoder
+    gc.collect()  # Group-offload hooks hold cyclic references to their modules.
+    empty_cache(device)
+
+    print(f"Loading VAE from {args.vae_root} on {device}", flush=True)
     vae = AutoencoderKLMiniMaxH3.from_pretrained(resolve_weights(args.vae_root), subfolder="vae").to(device)
     vae.eval()
+    print(f"VAE-encoding {len(keyframes)} image(s) on {device}", flush=True)
     with torch.no_grad():
         condition_latents = [
             encode_vae_condition(vae, torch.from_numpy(np.array(k)).to(device).permute(2, 0, 1)[None, :, None],

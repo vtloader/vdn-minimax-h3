@@ -3,6 +3,64 @@
 """
 import torch
 
+
+def _blocked_triangular_inverse(lower, block=16):
+    """Invert a batched lower-triangular matrix with NPU GEMMs.
+
+    ``torch.linalg.solve_triangular`` has no NPU kernel and falls back to AiCPU,
+    which serialises every DiT block.  Invert each 16x16 diagonal block by forward
+    substitution over its rows, then merge blocks with the Schur complement
+    ``-D^-1 C A^-1``.  The arithmetic is the same exact triangular inverse; only the
+    association changes, and all matrix products stay on the NPU.
+    """
+    shape = lower.shape
+    n = shape[-1]
+    if n % block or n < block:
+        raise ValueError(f"blocked triangular inverse needs a multiple of {block}, got {n}")
+    flat = lower.reshape(-1, n, n)
+    batch, blocks = flat.shape[0], n // block
+    diagonal = torch.stack(
+        [flat[:, offset:offset + block, offset:offset + block]
+         for offset in range(0, n, block)], dim=1)
+    identity = torch.eye(block, device=flat.device, dtype=flat.dtype)
+    inverse = torch.zeros_like(diagonal)
+    for row in range(block):
+        rhs = identity[row].expand(batch, blocks, block)
+        if row:
+            rhs = rhs - (diagonal[:, :, row, :row].unsqueeze(-2)
+                         @ inverse[:, :, :row, :]).squeeze(-2)
+        inverse[:, :, row, :] = rhs / diagonal[:, :, row, row].unsqueeze(-1)
+
+    size = block
+    while size < n:
+        left = inverse[:, 0::2]
+        right = inverse[:, 1::2]
+        cross = torch.stack(
+            [flat[:, offset + size:offset + 2 * size, offset:offset + size]
+             for offset in range(0, n, 2 * size)], dim=1)
+        lower_left = -(right @ cross @ left)
+        inverse = torch.cat([
+            torch.cat([left, torch.zeros_like(left)], dim=-1),
+            torch.cat([lower_left, right], dim=-1),
+        ], dim=-2)
+        size *= 2
+    return inverse.reshape(shape)
+
+
+def _triangular_inverse(lower):
+    """Exact inverse of a lower-triangular matrix, keeping inference GEMMs on the NPU.
+
+    The blocked path uses in-place row assembly, so it is inference-only. Training
+    keeps the autograd-safe trsm spelling (and its NPU AiCPU fallback).
+    """
+    if (lower.device.type == "npu" and lower.shape[-1] % 16 == 0
+            and not torch.is_grad_enabled()):
+        return _blocked_triangular_inverse(lower)
+    identity = torch.eye(lower.shape[-1], device=lower.device, dtype=lower.dtype)
+    return torch.linalg.solve_triangular(
+        lower, identity.expand_as(lower), upper=False, left=True)
+
+
 class SanaDelta:
     """Scaled subtractive delta: S_out = (S_in Diag(D))(I - c^2 A) + c B, c=1/sqrt(S).
     L2-normalized keys give trace(c^2 A) <= 1, hence 0 <= c^2 A <= I and (I - c^2 A) is
@@ -36,8 +94,9 @@ class VdnDelta:
     is the rule the released checkpoints use; its small equilibrium beta is cancelled
     by the branch norm before to_out_linear ever sees it.
 
-    The inverse is an exact Cholesky on cuBLAS/cuSOLVER batched kernels; a hand-written
-    single-CTA Triton fusion of it is far slower at 128x128."""
+    The inverse is an exact Cholesky.  On CUDA the batched trsm runs on cuSOLVER; on
+    NPU, where trsm has no kernel and falls back to AiCPU, `_triangular_inverse`
+    replaces it with blocked NPU GEMMs."""
 
     def __init__(self, tokens_per_frame: int = None):
         pass                                     # unscaled: S plays no part
@@ -53,7 +112,7 @@ class VdnDelta:
         # shape, so trading the second solve for a product is a clear win over the
         # F*H systems a frame bank holds. Same matrix to fp32 rounding on a different
         # association, not an approximation.
-        linv = torch.linalg.solve_triangular(chol, eye, upper=False, left=True)
+        linv = _triangular_inverse(chol)
         inv = linv.transpose(-1, -2) @ linv                   # symmetric by construction
         transition = alpha.unsqueeze(-1) * inv
         injection = B_raw.float() @ inv

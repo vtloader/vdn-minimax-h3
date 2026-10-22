@@ -56,15 +56,16 @@ def set_teacher_mode(model, enabled: bool):
         attn.teacher_mode = enabled
 
 
-def set_softmax_backend(model, backend: str) -> str:
+def set_softmax_backend(model, backend: str, device=None) -> str:
     """Runtime window-softmax implementation (config ``kernels.softmax_backend``):
     ``auto`` (decomposed on every CUDA device; see decomposed.resolve_softmax_backend) |
     ``flex`` (BlockMask, what training uses) | ``decomposed`` (the mask as a union of
-    dense calls) | ``ref`` (eager reference). Writes the resolved choice onto every
+    dense calls) | ``ref`` (eager reference) | ``npu_varlen`` (NPU-only TND fusion
+    attention). Writes the resolved choice onto every
     hybrid layer and returns it. Never part of a checkpoint's spec."""
     from src.models.softmax_attention.decomposed import resolve_softmax_backend
 
-    resolved = resolve_softmax_backend(backend)
+    resolved = resolve_softmax_backend(backend, device=device)
     for attn in iter_hybrids(model):
         attn.softmax_impl = resolved
     return resolved

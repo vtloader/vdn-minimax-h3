@@ -21,10 +21,17 @@ def _temporal_shift(x, w, k, pad):
     either conv spelling, and all of them agree to within one bf16 ulp.
     """
     xp = F.pad(x, (0, 0, 0, 0, pad, pad))
-    out = None
-    for dt in range(k):
-        part = xp[dt:dt + x.shape[0]] * w[:, dt].view(1, 1, -1)
-        out = part if out is None else out + part
+    out = xp[:x.shape[0]] * w[:, 0].view(1, 1, -1)
+    if torch.is_grad_enabled():
+        for dt in range(1, k):
+            out = out + xp[dt:dt + x.shape[0]] * w[:, dt].view(1, 1, -1)
+    else:
+        # Inference: the same taps in the same order, accumulated into `out`. The
+        # eager spelling above keeps every tap's result alive until the next add
+        # allocates another full-size tensor; in place, one input is reused. The
+        # arithmetic (and therefore the bits) is unchanged.
+        for dt in range(1, k):
+            out.add_(xp[dt:dt + x.shape[0]] * w[:, dt].view(1, 1, -1))
     return out
 
 

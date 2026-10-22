@@ -2,6 +2,8 @@
 import torch
 import torch.distributed as dist
 
+from src.utils.device import device_of
+
 
 def broadcast_and_verify_init(model, lora_params, device) -> None:
     """Rank-0-init semantics + proof, run BEFORE fully_shard.
@@ -20,8 +22,14 @@ def broadcast_and_verify_init(model, lora_params, device) -> None:
     # equal float64 sums. Any drift (a rank-dependent init that slipped through, a
     # corrupted shard read) shows up as an exact mismatch.
     names = [name for name, _ in model.named_parameters()]
-    sums = torch.tensor([p.detach().double().sum().item() for _, p in model.named_parameters()],
-                        dtype=torch.float64, device=device)
+    # Ascend 910 does not execute float64 tensors natively; float32 is sufficient for
+    # this cross-rank initialization fingerprint and avoids an implicit device cast.
+    fingerprint_dtype = torch.float32 if device_of(device).type == "npu" else torch.float64
+    sums = torch.tensor([
+        (p.detach().float().sum() if fingerprint_dtype == torch.float32
+         else p.detach().double().sum()).item()
+        for _, p in model.named_parameters()
+    ], dtype=fingerprint_dtype, device=device)
     reference = sums.clone()
     dist.broadcast(reference, src=0)
     mismatched = (sums != reference).nonzero().flatten().tolist()

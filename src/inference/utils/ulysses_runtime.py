@@ -16,8 +16,26 @@ from dataclasses import dataclass, field
 
 import torch
 import torch.distributed as dist
-import triton
-import triton.language as tl
+try:
+    import triton
+    import triton.language as tl
+except ImportError:  # NPU uses the native pack fallback below.
+    class _TritonUnavailable:
+        @staticmethod
+        def jit(fn):
+            return fn
+
+        @staticmethod
+        def cdiv(x, y):
+            return (x + y - 1) // y
+
+    class _TritonLanguageUnavailable:
+        constexpr = object
+
+    triton = _TritonUnavailable()
+    tl = _TritonLanguageUnavailable()
+
+from src.utils.device import distributed_backend, is_cuda, local_device, set_device, synchronize
 
 
 def sequence_splits(sequence_length: int, world_size: int) -> tuple[int, ...]:
@@ -129,12 +147,13 @@ class UlyssesRuntime:
     heads_per_rank: int = 0
     num_heads: int = 0
     softmax_ranks: int = 0
+    npu_head_parallel: bool = False
     softmax_head_splits: tuple[int, ...] = ()
     linear_head_splits: tuple[int, ...] = ()
     profile_enabled: bool = False
     softmax_dispatch_group: object | None = None
     linear_dispatch_group: object | None = None
-    profile_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = field(
+    profile_events: dict[str, list[tuple[object, object]]] = field(
         default_factory=dict
     )
 
@@ -148,14 +167,14 @@ class UlyssesRuntime:
     def profile_start(self):
         if not self.profile_enabled:
             return None
-        event = torch.cuda.Event(enable_timing=True)
+        event = getattr(torch, self.device.type).Event(enable_timing=True)
         event.record()
         return event
 
     def profile_end(self, name: str, start) -> None:
         if start is None:
             return
-        end = torch.cuda.Event(enable_timing=True)
+        end = getattr(torch, self.device.type).Event(enable_timing=True)
         end.record()
         self.profile_events.setdefault(name, []).append((start, end))
 
@@ -163,7 +182,7 @@ class UlyssesRuntime:
         self.profile_events.clear()
 
     def profile_milliseconds(self) -> dict[str, float]:
-        torch.cuda.synchronize(self.device)
+        synchronize(self.device)
         return {
             name: sum(start.elapsed_time(end) for start, end in events)
             for name, events in self.profile_events.items()
@@ -209,7 +228,7 @@ class UlyssesRuntime:
         self.softmax_ranks = softmax_ranks
 
     def configure(self, sequence_length: int, num_heads: int) -> None:
-        if not self.branch_parallel and num_heads % self.world_size:
+        if is_cuda(self.device) and not self.branch_parallel and num_heads % self.world_size:
             raise ValueError(
                 f"Ulysses needs num_heads divisible by world_size; got "
                 f"{num_heads} heads on {self.world_size} ranks"
@@ -519,7 +538,7 @@ class UlyssesRuntime:
         return sums, work
 
 
-def init_ulysses(backend: str = "nccl", *, profile_enabled: bool = False) -> UlyssesRuntime:
+def init_ulysses(backend: str | None = None, *, profile_enabled: bool = False) -> UlyssesRuntime:
     """Initialise the torchrun process group and bind this process to LOCAL_RANK.
 
     ``profile_enabled`` (config ``parallel.profile``) records CUDA events around every
@@ -533,7 +552,11 @@ def init_ulysses(backend: str = "nccl", *, profile_enabled: bool = False) -> Uly
             "infer_ulysses.py must be launched with torchrun and at least two ranks"
         )
     local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
+    device = local_device()
+    if device.type not in {"cuda", "npu"}:
+        raise RuntimeError("Ulysses requires CUDA or Ascend NPU")
+    backend = backend or distributed_backend(device)
+    set_device(device)
     if not dist.is_initialized():
         dist.init_process_group(backend=backend)
     rank = dist.get_rank()
@@ -544,12 +567,13 @@ def init_ulysses(backend: str = "nccl", *, profile_enabled: bool = False) -> Uly
         rank=rank,
         world_size=actual_world,
         local_rank=local_rank,
-        device=torch.device("cuda", local_rank),
+        device=device,
         backend=backend,
         profile_enabled=profile_enabled,
     )
 
     ranks = list(range(actual_world))
-    runtime.softmax_dispatch_group = dist.new_group(ranks=ranks, backend=backend)
-    runtime.linear_dispatch_group = dist.new_group(ranks=ranks, backend=backend)
+    if device.type == "cuda":
+        runtime.softmax_dispatch_group = dist.new_group(ranks=ranks, backend=backend)
+        runtime.linear_dispatch_group = dist.new_group(ranks=ranks, backend=backend)
     return runtime

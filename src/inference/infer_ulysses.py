@@ -31,21 +31,32 @@ from src.config.inference import (
 )
 from src.inference.utils.assemble import (
     build_inference_model,
+    install_inference_offload,
     latents_path,
+    release_resident_blocks,
     render_record,
     write_json,
 )
 from src.inference.render import decode_and_save, generate_latents
 from src.inference.utils.prompt_cache import conditioning_mode, load_prompt
 from src.inference.utils.ulysses import init_ulysses, install_ulysses
+from src.utils.device import synchronize
+
+
+def validate_ulysses_entrypoint(cfg):
+    """Reject weight TP before validate-only exits or Ulysses initializes."""
+    if cfg.parallel.npu_tensor_parallel:
+        raise ValueError("npu_tensor_parallel requires the dedicated src/inference/infer_tp.py")
 
 
 def main():
     process_started = time.perf_counter()
     cfg = load_config(
         InferenceConfig,
-        extra_validators=[validate_ablation, validate_kernels, validate_parallel],
+        extra_validators=[validate_ablation, validate_kernels, validate_parallel,
+                          validate_ulysses_entrypoint],
     )
+    validate_ulysses_entrypoint(cfg)
     if not cfg.checkpoint:
         raise ValueError("the dedicated Ulysses path requires a hybrid checkpoint")
     if cfg.behavior.teacher_mode:
@@ -56,12 +67,22 @@ def main():
     torch.set_grad_enabled(False)
 
     model = build_inference_model(
-        cfg, device, load_decoders=runtime.is_main, log=runtime.is_main
+        cfg, device, load_decoders=runtime.is_main, log=runtime.is_main,
+        install_offload=False,
     )
     if not model.is_hybrid:
         raise ValueError("Ulysses path currently requires a HybridAttention checkpoint")
 
-    install_ulysses(model.transformer, runtime, softmax_ranks=cfg.parallel.softmax_ranks)
+    install_ulysses(
+        model.transformer,
+        runtime,
+        softmax_ranks=cfg.parallel.softmax_ranks,
+        npu_head_parallel=cfg.parallel.npu_head_parallel,
+    )
+    if cfg.render.offload_dit:
+        say = print if runtime.is_main else (lambda *args, **kwargs: None)
+        model.npu_resident_blocks, model.npu_pinned_offload = install_inference_offload(
+            model.transformer, device, cfg, say=say)
     if runtime.is_main and runtime.branch_parallel:
         print(
             f"branch-parallel Ulysses: {runtime.softmax_ranks} softmax ranks + "
@@ -69,6 +90,15 @@ def main():
             f"QKV projected once on sequence owners",
             flush=True,
         )
+    elif runtime.is_main and runtime.npu_head_parallel:
+        print(
+            f"NPU head-parallel Ulysses: {runtime.world_size} ranks, HCCL all-to-all "
+            f"QKV, {runtime.heads_per_rank} heads/rank, eager head-sliced far branch",
+            flush=True,
+        )
+    elif runtime.is_main and device.type == "npu":
+        print(f"NPU sequence fallback: {runtime.world_size} ranks, HCCL all-gather "
+              "and eager attention on every rank", flush=True)
     elif runtime.is_main:
         print(
             f"standard Ulysses: {runtime.world_size} ranks, every rank owns heads of "
@@ -80,7 +110,7 @@ def main():
     if conditions and runtime.is_main:
         print(f"{conditioning_mode(conditions[0])}: keyframes anchored {conditions[0]}", flush=True)
     runtime.barrier()
-    torch.cuda.synchronize(device)
+    synchronize(device)
     model_setup_seconds = time.perf_counter() - process_started
 
     def sample(num_steps, step_seconds=None):
@@ -97,6 +127,8 @@ def main():
             runtime=runtime,
             step_seconds=step_seconds,
             conditions=conditions,
+            width=cfg.render.width,
+            height=cfg.render.height,
         )
 
     warmup_steps = cfg.render.warmup_steps
@@ -126,6 +158,12 @@ def main():
     dist.all_gather_object(profile_by_rank, local_profile)
     timings["parallel_profile_ms_per_nfe_by_rank"] = profile_by_rank
 
+    if model.npu_resident_blocks and release_resident_blocks(model, device):
+        if runtime.is_main:
+            print(f"npu residency: releasing {model.npu_resident_blocks} resident "
+                  f"block(s) before decode ({model.resident_release_seconds:.2f}s)",
+                  flush=True)
+
     if runtime.is_main and cfg.render.save_latents:
         lpath = latents_path(cfg)
         os.makedirs(os.path.dirname(lpath) or ".", exist_ok=True)
@@ -134,9 +172,10 @@ def main():
     decode_started = time.perf_counter()
     if runtime.is_main:
         decode_and_save(
-            latents, audio_latents, model.vae, model.audio_vae, cfg.render.out, str(device)
+            latents, audio_latents, model.vae, model.audio_vae, cfg.render.out, str(device),
+            fps=cfg.render.fps,
         )
-        torch.cuda.synchronize(device)
+        synchronize(device)
 
     runtime.barrier()
     timings["decode_and_encode_seconds"] = time.perf_counter() - decode_started
@@ -145,12 +184,15 @@ def main():
     if runtime.is_main:
         record = render_record(cfg, model)
         record["parallel"] = {
-            "kind": "ulysses_branch_parallel" if runtime.branch_parallel else "ulysses",
+            "kind": ("npu_head_parallel" if runtime.npu_head_parallel
+                     else "npu_sequence_reference" if device.type == "npu"
+                     else "ulysses_branch_parallel" if runtime.branch_parallel else "ulysses"),
             "world_size": runtime.world_size,
             "backend": runtime.backend,
             "sequence_splits": list(runtime.splits),
             "heads_per_rank": runtime.heads_per_rank,
             "softmax_ranks": runtime.softmax_ranks,
+            "npu_head_parallel": runtime.npu_head_parallel,
             "softmax_head_splits": list(runtime.softmax_head_splits),
             "linear_head_splits": list(runtime.linear_head_splits),
             "warmup_steps": warmup_steps,

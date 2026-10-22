@@ -35,6 +35,9 @@ from src.utils import run_lock
 from src.utils.distributed import broadcast_and_verify_init
 from src.utils.lr_classes import lr_class_map
 from src.utils.lr_schedule import lr_at
+from src.utils.device import (distributed_backend, local_device,
+                              max_memory_allocated, reset_peak_memory_stats,
+                              set_device, set_memory_fraction, synchronize)
 
 STAGE = "a2"
 WEIGHTS_PREFIX = "hybrid_step"
@@ -85,7 +88,7 @@ def profile_step(prof_step, step, micro, grad_accum, rank):
     torch.profiler (CUDA kernels only, aggregated — no trace file) and print the kernel
     table + a bucket summary. Only rank 0 profiles; the others just wait at the
     collectives, so the step's wall time is inflated but attribution holds."""
-    if not (prof_step and rank == 0 and step + 1 == prof_step
+    if not (prof_step and torch.cuda.is_available() and rank == 0 and step + 1 == prof_step
             and (micro + 1) % grad_accum == 0):
         return None
     prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA])
@@ -94,7 +97,7 @@ def profile_step(prof_step, step, micro, grad_accum, rank):
 
 
 def report_profile(prof, prof_step):
-    torch.cuda.synchronize()
+    synchronize("cuda")
     prof.__exit__(None, None, None)
     evs = prof.key_averages()
     print(f"=== H3_PROF step {prof_step}: top kernels (rank 0) ===", flush=True)
@@ -132,12 +135,11 @@ def main():
     fs.refuse_if_guarded(out_dir, os.path.join(out_dir, f"{WEIGHTS_PREFIX}{max_steps:06d}.pt"),
                          cfg.training.ignore_stopped)
 
-    dist.init_process_group("nccl")
+    device = local_device()
+    set_device(device)
+    dist.init_process_group(distributed_backend(device))
     rank, world = dist.get_rank(), dist.get_world_size()
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    device = f"cuda:{local_rank}"
-    torch.cuda.set_per_process_memory_fraction(cfg.distributed.memory_fraction)
+    set_memory_fraction(cfg.distributed.memory_fraction, device)
     torch.manual_seed(cfg.training.seed)   # same-seed init; FSDP2 does not broadcast
 
     # -------- build seam: the A1 artifact decides EVERYTHING structural --------
@@ -146,7 +148,7 @@ def main():
     if rank == 0:
         fs.print_architecture(spec_dict, "A1 architecture")
     model = build_model(spec_dict, device="cpu", base_source=cfg.initialization.base_source)
-    set_softmax_backend(model, cfg.runtime.kernels.softmax_backend)
+    set_softmax_backend(model, cfg.runtime.kernels.softmax_backend, device=device)
     loaded = load_model_weights(model, art.weights)
     del art
     model.requires_grad_(False)
@@ -259,7 +261,7 @@ def main():
             dist.all_reduce(avg, op=dist.ReduceOp.AVG)
             if rank == 0:
                 dt = time.time() - t_log
-                peak = torch.cuda.max_memory_allocated() / 2**30
+                peak = max_memory_allocated(device) / 2**30
                 print(f"[step {step}/{max_steps}] loss={avg[0]:.4f} "
                       f"(video {avg[1]:.4f}, audio {avg[2]:.4f}) diff={avg[3]:.4f} "
                       f"grad_norm={grad_norm:.4f} "
@@ -277,7 +279,7 @@ def main():
                                         **fs.phase_fields()}) + "\n")
             t_log = time.time()
             fs.phase_reset()
-            torch.cuda.reset_peak_memory_stats()
+            reset_peak_memory_stats(device)
             periodic = step % cfg.checkpoint.save_every == 0 or step == max_steps
             if periodic or step in early_saves:
                 save_weights(step)

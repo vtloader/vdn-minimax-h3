@@ -40,6 +40,9 @@ from src.utils import run_lock
 from src.utils.distributed import broadcast_and_verify_init
 from src.utils.lr_classes import lr_class_map
 from src.utils.lr_schedule import lr_at
+from src.utils.device import (distributed_backend, empty_cache, local_device,
+                              max_memory_allocated, reset_peak_memory_stats,
+                              set_device, set_memory_fraction)
 
 STAGE = "b"
 WEIGHTS_PREFIX = "hybrid_lora_step"
@@ -185,12 +188,11 @@ def run(cfg, stage=STAGE, model_spec_adapter=None):
     fs.refuse_if_guarded(
         output_dir, final_weights_path, cfg.training.ignore_stopped)
 
-    dist.init_process_group("nccl")
+    device = local_device()
+    set_device(device)
+    dist.init_process_group(distributed_backend(device))
     rank, world = dist.get_rank(), dist.get_world_size()
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    device = f"cuda:{local_rank}"
-    torch.cuda.set_per_process_memory_fraction(cfg.distributed.memory_fraction)
+    set_memory_fraction(cfg.distributed.memory_fraction, device)
     torch.manual_seed(cfg.training.seed)   # same-seed init; FSDP2 does not broadcast
 
     # The initialization checkpoint carries the model recipe and the learned deltas;
@@ -211,7 +213,7 @@ def run(cfg, stage=STAGE, model_spec_adapter=None):
     model = build_model(
         resolved_model_spec, device="cpu",
         base_source=cfg.initialization.base_source)
-    set_softmax_backend(model, cfg.runtime.kernels.softmax_backend)
+    set_softmax_backend(model, cfg.runtime.kernels.softmax_backend, device=device)
     transform_weights = {
         name: tensor
         for name, tensor in initialization_checkpoint.weights.items()
@@ -305,7 +307,7 @@ def run(cfg, stage=STAGE, model_spec_adapter=None):
     # first all-gather. This is not the replica fix above (allocated memory is already
     # shard-sized); it makes the physical baseline deterministic as well.
     gc.collect()
-    torch.cuda.empty_cache()
+    empty_cache(device)
     if rank == 0:
         print(f"saved-tensor CPU offload: {cfg.distributed.offload_activations}", flush=True)
 
@@ -404,7 +406,7 @@ def run(cfg, stage=STAGE, model_spec_adapter=None):
             dist.all_reduce(avg, op=dist.ReduceOp.AVG)
             if rank == 0:
                 dt = time.time() - t_log
-                peak = torch.cuda.max_memory_allocated() / 2**30
+                peak = max_memory_allocated(device) / 2**30
                 ref = "" if cfg.training.objective == "diffusion" else f" diff={avg[3]:.4f}"
                 print(f"[step {step}/{max_steps}] loss={avg[0]:.4f} "
                       f"(video {avg[1]:.4f}, audio {avg[2]:.4f}){ref} grad_norm={grad_norm:.4f} "
@@ -431,7 +433,7 @@ def run(cfg, stage=STAGE, model_spec_adapter=None):
                                         **fs.phase_fields()}) + "\n")
             t_log = time.time()
             fs.phase_reset()
-            torch.cuda.reset_peak_memory_stats()
+            reset_peak_memory_stats(device)
             periodic = step % cfg.checkpoint.save_every == 0 or step == max_steps
             if periodic or step in early_saves:
                 save_weights(step)

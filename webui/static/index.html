@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VDN-H3 视频生成</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="page">
+    <header>
+      <p class="eyebrow">VDN-MINIMAX-H3</p>
+      <h1>视频生成</h1>
+      <p class="lede">输入提示词，选择模式，生成视频。</p>
+    </header>
+
+    <form id="task-form" class="card">
+      <div class="form-layout">
+        <div class="prompt-field">
+          <label for="prompt">提示词</label>
+          <textarea id="prompt" name="prompt" rows="10" maxlength="20000" required
+            placeholder="描述画面、主体和动作。"></textarea>
+        </div>
+        <div class="field-stack">
+          <div>
+            <label for="mode">生成模式</label>
+            <select id="mode" name="mode">
+              <option value="t2va">t2va · 文本生成</option>
+              <option value="i2va">i2va · 首帧生成</option>
+              <option value="fl2va">fl2va · 首尾帧生成</option>
+              <option value="ref2va">ref2va · 参考图生成</option>
+            </select>
+          </div>
+
+          <section id="image-fields" class="image-fields hidden" aria-live="polite">
+            <div id="first-field" class="upload-field hidden">
+              <label for="first">首帧图片</label>
+              <input id="first" name="first" type="file" accept="image/png,image/jpeg,image/webp,image/bmp">
+              <button id="clear-first" class="secondary-button" type="button" aria-label="清除首帧图片" disabled>清除图片</button>
+              <div id="first-preview" class="upload-previews" aria-live="polite"></div>
+            </div>
+            <div id="last-field" class="upload-field hidden">
+              <label for="last">尾帧图片</label>
+              <input id="last" name="last" type="file" accept="image/png,image/jpeg,image/webp,image/bmp">
+              <button id="clear-last" class="secondary-button" type="button" aria-label="清除尾帧图片" disabled>清除图片</button>
+              <div id="last-preview" class="upload-previews" aria-live="polite"></div>
+            </div>
+            <div id="refs-field" class="upload-field hidden">
+              <label for="refs">参考图片</label>
+              <input id="refs" name="refs" type="file" multiple accept="image/png,image/jpeg,image/webp,image/bmp">
+              <button id="clear-refs" class="secondary-button" type="button" aria-label="清除所有参考图片" disabled>清除图片</button>
+              <small>按上传顺序对应 Picture 1、Picture 2…，最多 16 张。</small>
+              <div id="refs-preview" class="upload-previews" aria-live="polite"></div>
+            </div>
+            <small>PNG、JPEG、WebP 或 BMP；单张不超过 20 MiB，单次请求不超过 80 MiB。</small>
+            <p id="mode-hint" class="muted"></p>
+          </section>
+        </div>
+      </div>
+
+      <section class="config-panel" aria-labelledby="config-heading">
+        <h2 id="config-heading">生成参数</h2>
+        <div class="config-grid">
+          <div>
+            <label for="sampling">采样方案</label>
+            <select id="sampling" name="sampling" aria-describedby="sampling-hint">
+              <option value="accelerated" selected>加速采样 · 推荐 8 步</option>
+              <option value="standard">标准采样 · 推荐 50 步</option>
+              <option value="custom">自定义模型</option>
+            </select>
+            <small id="sampling-hint">加速采样使用 ckpts/stage-dmd-step-250，推荐 8 步。</small>
+          </div>
+          <div>
+            <label for="steps">去噪步数</label>
+            <input id="steps" name="steps" type="number" min="1" max="100" step="1" value="8" required>
+            <small>所有方案均可手动调整为 1–100 步；切换预设方案会填入推荐值。</small>
+          </div>
+          <div>
+            <label for="resolution">分辨率</label>
+            <select id="resolution" name="resolution" aria-describedby="resolution-hint">
+              <option value="1920x1088" selected>1920 × 1088 · 1080p</option>
+              <option value="1344x768">1344 × 768 · 横屏</option>
+              <option value="896x512">896 × 512</option>
+              <option value="1280x736">1280 × 736</option>
+              <option value="768x1344">768 × 1344 · 竖屏</option>
+              <option value="768x768">768 × 768 · 方形</option>
+              <option value="512x288">512 × 288 · TP 预览</option>
+              <option value="custom">自定义</option>
+            </select>
+            <small id="resolution-hint">自定义宽高须为 256–2048 的 32 倍数，宽高比为 1:4 至 4:1。</small>
+          </div>
+          <div class="field-grid">
+            <div>
+              <label for="width">宽度</label>
+              <input id="width" name="width" type="number" min="256" max="2048" step="32" value="1920" readonly required aria-describedby="resolution-hint">
+            </div>
+            <div>
+              <label for="height">高度</label>
+              <input id="height" name="height" type="number" min="256" max="2048" step="32" value="1088" readonly required aria-describedby="resolution-hint">
+            </div>
+          </div>
+          <div>
+            <label for="duration">请求时长（秒）</label>
+              <input id="duration" name="duration" type="number" min="1" max="15" step="0.001" value="10" required aria-describedby="duration-hint timing-note">
+              <input id="frames" name="frames" type="hidden" value="243">
+              <small id="duration-hint">原生 243 帧 · 实际 10.125 秒 · 预计输出 243 帧。</small>
+          </div>
+          <div>
+            <label for="fps">导出 FPS</label>
+            <select id="fps" name="fps" aria-describedby="fps-hint">
+              <option value="12">12</option>
+              <option value="24" selected>24 · 原生</option>
+              <option value="25">25</option>
+              <option value="30">30</option>
+              <option value="48">48</option>
+              <option value="60">60</option>
+            </select>
+            <small id="fps-hint">模型原生 24 FPS；其他导出帧率采用抽帧/重复帧，不是运动插帧。按实际时长同步音频。</small>
+          </div>
+        </div>
+        <small id="timing-note">原生帧数按最接近的 17n+5 对齐（至少 22 帧，15 秒请求对应 362 帧）。时长与帧数为前端估算，最终以服务端校验为准。</small>
+        <p id="config-summary" class="config-summary" role="status" aria-live="polite"></p>
+      </section>
+
+      <details id="advanced-settings" class="advanced-settings">
+        <summary>高级设置</summary>
+        <div class="field-stack advanced-fields">
+          <div>
+            <label for="checkpoint">模型权重路径</label>
+            <input id="checkpoint" name="checkpoint" value="ckpts/stage-dmd-step-250" spellcheck="false" readonly required aria-describedby="checkpoint-hint">
+            <small id="checkpoint-hint">预设方案自动选择权重；选择“自定义模型”后可编辑路径。</small>
+          </div>
+          <div>
+            <label for="model-root">本地文本编码器快照路径（可选）</label>
+            <input id="model-root" name="model_root" placeholder="留空则自动从 Hugging Face 获取" spellcheck="false">
+          </div>
+          <div class="field-grid">
+            <div>
+              <label for="device">运行设备</label>
+              <input id="device" name="device" value="npu:0" pattern="(?:npu|cuda):[0-9]+" title="格式为 npu:0 或 cuda:0" spellcheck="false" required>
+              <small>如 <code>npu:0</code> 或 <code>cuda:0</code>。</small>
+            </div>
+            <div>
+              <label for="seed">随机种子</label>
+              <input id="seed" name="seed" type="number" min="0" max="9223372036854775807" step="1" value="42" required>
+            </div>
+          </div>
+          <div class="field-grid">
+            <div>
+              <label for="npu-resident-blocks">NPU 常驻 block 数</label>
+              <input id="npu-resident-blocks" name="npu_resident_blocks" type="number" min="0" max="49" step="1" value="0" aria-describedby="resident-hint">
+              <small id="resident-hint">0 为全部分块卸载；仅在 NPU 且开启分块卸载时生效。不限制帧数，但大帧数/高分块数可能 OOM。</small>
+            </div>
+          </div>
+          <div class="check-row">
+            <label class="check-label"><input id="offload" name="offload" type="checkbox" checked> 分块卸载到 CPU</label>
+            <label id="optimized-row" class="check-label hidden"><input id="optimized-cuda" name="optimized_cuda" type="checkbox"> CUDA FP8 优化</label>
+          </div>
+          <small>CUDA FP8 是独立的设备优化选项，与加速/标准采样方案无关。</small>
+          <div class="check-row">
+            <label class="check-label"><input id="tensor-parallel" name="tensor_parallel" type="checkbox" checked aria-describedby="tp-hint"> 实验性双 NPU TP</label>
+          </div>
+          <div id="tp-options" class="hidden">
+            <label for="tp-parity">TP 精度模式</label>
+            <select id="tp-parity" name="tp_parity" disabled>
+              <option value="row_gather">row_gather · 逐位一致 · 速度优先</option>
+              <option value="row_stream" selected>row_stream · 逐位一致 · 显存优先（默认）</option>
+
+              <option value="off">off · 最快 · 非逐位</option>
+            </select>
+            <div>
+              <label for="tp-offload-strategy">TP 卸载策略</label>
+              <select id="tp-offload-strategy" name="tp_offload_strategy" disabled>
+                <option value="retained">retained · 保留 CPU 权重（启动快）</option>
+                <option value="prefetch" selected>prefetch · 预取下一 block（denoise 最快；首次启动约 38s，之后复用 worker）</option>
+              </select>
+            </div>
+            <div>
+              <label for="tp-merge-device">LoRA 合并方式</label>
+              <select id="tp-merge-device" name="tp_merge_device" disabled>
+                <option value="cpu" selected>CPU 合并 · 逐位一致</option>
+                <option value="npu">NPU 合并 · 非逐位</option>
+              </select>
+            </div>
+            <div>
+              <label for="tp-cache">TP cache 路径（CPU 合并，可选）</label>
+              <input id="tp-cache" name="tp_cache" type="text" value="/var/tmp/vdn_tp_cache" placeholder="/path/to/tp_cache" disabled aria-describedby="tp-cache-hint">
+              <small id="tp-cache-hint">已合并的 rank shard 缓存，跳过 CPU 组装；与 NPU 合并互斥。路径缺失或与 checkpoint 不匹配时会自动生成（约 8–11 分钟）；留空则每次启动都现场组装。默认路径在 /var/tmp，重启服务后仍可复用。</small>
+            </div>
+            <div id="tp-delta-row" class="hidden">
+              <label for="tp-merge-delta">NPU delta 计算</label>
+              <select id="tp-merge-delta" name="tp_merge_delta_device" disabled>
+                <option value="npu" selected>NPU delta · 最快，非逐位</option>
+                <option value="cpu">CPU delta + NPU 更新 · 逐位一致</option>
+              </select>
+            </div>
+            <small id="tp-hint">实验性双 NPU TP，支持“分块卸载到 CPU”：retained 保留 CPU 权重，启动快；prefetch 额外预取下一 block，denoise 更快，但每卡需约 36GB pinned host 内存，两卡并发 pin 后首次启动约 38s。首次生成后 worker 常驻，同配置再次生成不再加载模型；同一 prompt 也会复用编码结果。不限制帧数/分辨率，过大仍可能 OOM。NPU 合并启动更快；逐位质量请用 CPU 合并、CPU delta 或缓存。</small>
+          </div>
+        </div>
+      </details>
+      <p id="form-error" class="error" role="alert"></p>
+      <div class="form-actions"><button id="submit-button" type="submit">开始生成</button></div>
+    </form>
+
+    <section class="card latest-card">
+      <div class="section-title">
+        <h2>最近任务</h2>
+        <a id="latest-log-link" class="hidden" href="#">查看日志</a>
+      </div>
+      <p id="latest-refresh-error" class="error" role="status"></p>
+      <div id="latest-empty" class="muted">正在获取任务状态…</div>
+      <div id="latest-task" class="hidden">
+        <div class="status-line"><strong id="latest-status"></strong><span id="latest-stage"></span></div>
+        <div class="progress"><div id="latest-progress-bar" class="progress-bar" role="progressbar" aria-label="总体进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div></div>
+        <p id="latest-progress-text" class="muted"></p>
+        <p id="latest-error" class="error" role="alert"></p>
+        <div id="latest-video" class="video-panel hidden">
+          <h2>生成结果</h2>
+          <video id="latest-video-player" controls preload="metadata"></video>
+          <a id="latest-video-link" href="#" download="output.mp4">下载视频</a>
+        </div>
+      </div>
+    </section>
+
+    <section class="card history-card">
+      <div class="section-title"><h2>历史任务</h2></div>
+      <div id="history" class="history-list"><div class="muted">正在获取历史记录…</div></div>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

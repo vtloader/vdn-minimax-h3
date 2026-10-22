@@ -54,8 +54,24 @@ The granularity follows the capability alone -- it is not a knob.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import triton
-import triton.language as tl
+try:
+    import triton
+    import triton.language as tl
+except ImportError:  # CUDA-only optional dependency; NPU uses the bf16 path.
+    class _TritonUnavailable:
+        @staticmethod
+        def jit(fn):
+            return fn
+
+        @staticmethod
+        def cdiv(x, y):
+            return (x + y - 1) // y
+
+    class _TritonLanguageUnavailable:
+        constexpr = object
+
+    triton = _TritonUnavailable()
+    tl = _TritonLanguageUnavailable()
 
 FP8_DTYPE = torch.float8_e4m3fn
 _FP8_MAX = torch.finfo(FP8_DTYPE).max

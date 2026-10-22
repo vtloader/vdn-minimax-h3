@@ -2,9 +2,14 @@
 ckpts/
 results/
 logs/
+artifacts/
+.pytest_cache/
 
 # local-only helpers (weight staging, run wrappers); not part of the release
 scripts/local/
+
+# project virtual environment
+.venv/
 
 __pycache__/
 *.pyc
@@ -13,3 +18,6 @@ __pycache__/
 # fetched by scripts/setup_diffusers.sh (upstream pin + diffusers_patches/)
 diffusers/
 *.egg-info/
+
+# browser WebUI task inputs, caches, logs, and generated videos
+webui/runs/

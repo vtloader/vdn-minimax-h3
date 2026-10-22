@@ -29,6 +29,8 @@ from diffusers import ModularPipeline
 from diffusers.hooks import apply_group_offloading
 from diffusers.utils.export_utils import encode_video
 
+from src.utils.device import device_of, generator
+
 REPO = "OpenVDN/vdn-minimax-h3"
 FPS = 24
 # The repository's own showcase prompt. Every prompt cache carries the text it was
@@ -43,8 +45,9 @@ def offload(pipe, device, dit=False):
     only hook those fire. With `dit` the transformer streams in by block, and otherwise
     it stays on the GPU. It offloads whole or by block, never by leaf: its fused kernels
     read a child's weights without calling the child, so a leaf's hook never fires."""
+    use_stream = device_of(device).type == "cuda"
     apply_group_offloading(pipe.text_encoder, onload_device=device, offload_device="cpu",
-                           offload_type="leaf_level", use_stream=True)
+                           offload_type="leaf_level", use_stream=use_stream)
     _, vae = cpu_offload_with_hook(pipe.vae, execution_device=device)
     cpu_offload_with_hook(pipe.audio_vae, execution_device=device, prev_module_hook=vae)
 
@@ -57,7 +60,7 @@ def offload(pipe, device, dit=False):
         return
     apply_group_offloading(pipe.transformer, onload_device=device, offload_device="cpu",
                            offload_type="block_level", num_blocks_per_group=1,
-                           use_stream=True)
+                           use_stream=use_stream)
 
 
 def main():
@@ -89,7 +92,10 @@ def main():
                         "transformer offloads whole or by block, never by leaf")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda")
+    p.add_argument("--model", default=REPO, help="Hub repository or local weights root")
     args = p.parse_args()
+    if args.fp8 and device_of(args.device).type != "cuda":
+        p.error("--fp8 is only supported by the CUDA TorchAO path")
     prompt = args.prompt or torch.load(DEFAULT_PROMPT, map_location="cpu",
                                        weights_only=True)["prompt"]
 
@@ -102,7 +108,20 @@ def main():
         if args.last:
             keyframes["last_image"] = load_image(args.last)
 
-    pipe = ModularPipeline.from_pretrained(REPO, workflow="fl2va" if keyframes else "t2va")
+    pipe = ModularPipeline.from_pretrained(args.model, workflow="fl2va" if keyframes else "t2va")
+
+    if device_of(args.device).type == "npu":
+        # Published remote code predates this repository's NPU dispatch. Load the
+        # component with the local, adapted class before loading the other components.
+        from src.diffusers_export.modeling import VDNMiniMaxH3Transformer3DModel
+
+        transformer = VDNMiniMaxH3Transformer3DModel.from_pretrained(
+            args.model,
+            subfolder=args.transformer or "stage-dmd-step-250/diffusers",
+            torch_dtype=torch.bfloat16,
+            softmax_backend="ref",
+        )
+        pipe.update_components(transformer=transformer)
 
     load_kwargs = {"trust_remote_code": True, "torch_dtype": torch.bfloat16}
     if args.transformer:
@@ -117,7 +136,7 @@ def main():
         prompt=prompt,
         num_frames=args.frames,
         num_inference_steps=args.steps + 1,
-        generator=torch.Generator(args.device).manual_seed(args.seed),
+        generator=generator(args.device, args.seed),
         output=["videos", "audio", "sampling_rate"],
         **keyframes,
     ).values()

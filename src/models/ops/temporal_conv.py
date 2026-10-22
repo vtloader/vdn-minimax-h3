@@ -28,8 +28,24 @@ alternative path.
 """
 
 import torch
-import triton
-import triton.language as tl
+try:
+    import triton
+    import triton.language as tl
+except ImportError:  # CUDA-only optional dependency; NPU uses the eager feature path.
+    class _TritonUnavailable:
+        @staticmethod
+        def jit(fn):
+            return fn
+
+        @staticmethod
+        def cdiv(x, y):
+            return (x + y - 1) // y
+
+    class _TritonLanguageUnavailable:
+        constexpr = object
+
+    triton = _TritonUnavailable()
+    tl = _TritonLanguageUnavailable()
 
 BLOCK_T = 16
 

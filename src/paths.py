@@ -6,7 +6,9 @@ the render default are all written relative to the repository root
 directory is not present locally it is fetched from the Hub (`HF_WEIGHTS_REPO`, the
 same layout) into the huggingface cache and used from there. Absolute paths pass through.
 """
+import json
 import os
+from pathlib import Path
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -16,6 +18,7 @@ LEGACY_WEIGHTS_PREFIX = "ckpts/converted/"   # how the training repo spells the 
 
 H3_BASE = WEIGHTS_PREFIX + "h3-base"     # transformer/ vae/ audio_vae/ of the release
 H3_UPSTREAM_REPO = "MiniMaxAI/MiniMax-H3"   # text_encoder/ tokenizer/ -- prompt encoding only
+TEXT_ENCODER_ROOT = WEIGHTS_PREFIX + "text-encoder"
 
 
 def resolve_repo_path(path):
@@ -49,8 +52,54 @@ def resolve_weights(path):
 
 
 def upstream_snapshot(*subfolders):
-    """The MiniMax-H3 Hub snapshot restricted to `subfolders` (downloaded on first use)."""
-    from huggingface_hub import snapshot_download
+    """Download only the conditioner into the project's weights directory.
 
-    return snapshot_download(H3_UPSTREAM_REPO,
-                             allow_patterns=[f"{s}/**" for s in subfolders])
+    The text encoder alone is about 66.7 GB. Store it on the weights volume rather
+    than in ~/.cache, and reuse a complete local copy without requiring the Hub.
+    HTTP is the default transport: some Hub mirrors serve metadata but cannot obtain
+    usable Xet/CAS credentials. HF_HUB_DISABLE_XET=0 opts back into Xet.
+    """
+    root = Path(resolve_repo_path(TEXT_ENCODER_ROOT))
+    if _conditioner_complete(root, subfolders):
+        print(f"Using local text encoder: {root}", flush=True)
+        return str(root)
+
+    from huggingface_hub import constants, snapshot_download
+
+    # Transformers may already have imported huggingface_hub before this helper runs;
+    # its constants are initialized at import time, so setting only os.environ here
+    # would not change the transport used by file_download.
+    if os.environ.get("HF_HUB_DISABLE_XET", "1").upper() in {"1", "ON", "YES", "TRUE"}:
+        constants.HF_HUB_DISABLE_XET = True
+    print(f"Downloading processor/text_encoder from {H3_UPSTREAM_REPO} into {root} "
+          f"({'HTTP' if constants.HF_HUB_DISABLE_XET else 'Xet'}; resumable)", flush=True)
+    return snapshot_download(
+        H3_UPSTREAM_REPO,
+        allow_patterns=[f"{s}/**" for s in subfolders],
+        local_dir=str(root),
+        max_workers=2,
+    )
+
+
+def _conditioner_complete(root, subfolders):
+    """Check the required configs and every shard referenced by the weight index."""
+    for folder in subfolders:
+        directory = root / folder
+        if folder == "processor":
+            required = [directory / "preprocessor_config.json",
+                        directory / "tokenizer_config.json", directory / "tokenizer.json"]
+        elif folder == "text_encoder":
+            index = directory / "model.safetensors.index.json"
+            try:
+                weights = json.loads(index.read_text())["weight_map"]
+                shards = set(weights.values())
+                if not shards or any(Path(name).name != name for name in shards):
+                    return False
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                return False
+            required = [directory / "config.json", index, *(directory / name for name in shards)]
+        else:
+            return False
+        if any(not path.is_file() or path.stat().st_size == 0 for path in required):
+            return False
+    return bool(subfolders)

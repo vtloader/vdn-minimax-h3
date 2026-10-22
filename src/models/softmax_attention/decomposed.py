@@ -30,6 +30,8 @@ at this shape, SDPA's own choice elsewhere.
 """
 
 
+import itertools
+
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.functional import scaled_dot_product_attention
@@ -40,7 +42,7 @@ from src.models.softmax_attention.window import has_fa4_kernels
 _PLAN_CACHE = {}
 _KERNEL_CACHE = {}
 MAX_CACHED_PLANS = 4
-SOFTMAX_BACKENDS = ("auto", "flex", "decomposed", "ref")
+SOFTMAX_BACKENDS = ("auto", "flex", "decomposed", "ref", "npu_varlen")
 
 
 def _fa4_varlen():
@@ -84,7 +86,7 @@ def _dense_backends():
             SDPBackend.CUDNN_ATTENTION]      # no MATH: it materialises the full score matrix
 
 
-def resolve_softmax_backend(backend: str) -> str:
+def resolve_softmax_backend(backend: str, device=None) -> str:
     """Config ``kernels.softmax_backend`` -> the implementation that will run. ``auto``
     is ``decomposed`` on every CUDA device: on sm100 it is the faster kernel, on sm90 it
     matches flex at the production width and is the same distance from the fp32
@@ -92,10 +94,24 @@ def resolve_softmax_backend(backend: str) -> str:
     architectures, the exact window with no mask machinery; flex stays what training
     uses. A CUDA device with no varlen kernel raises here, naming the install.
     ``flex`` / ``decomposed`` force either kernel; ``ref`` is the eager reference for
-    parity/debug."""
+    parity/debug. ``npu_varlen`` is the NPU-only explicit opt-in (TND fusion attention)
+    and is rejected on every other device. ``auto`` on NPU stays ``ref``."""
     if backend not in SOFTMAX_BACKENDS:
         raise ValueError(f"kernels.softmax_backend={backend!r}; expected one of "
                          f"{SOFTMAX_BACKENDS}")
+    device_type = None if device is None else torch.device(device).type
+    if backend == "npu_varlen":
+        if device_type != "npu":
+            raise ValueError(
+                "kernels.softmax_backend='npu_varlen' is NPU-only; select it with "
+                f"an npu target device, got {device!r}"
+            )
+        return "npu_varlen"
+    if device_type is not None and device_type != "cuda":
+        # FlexAttention, FA4 varlen and the decomposed CUDA path are backend-specific.
+        # The eager reference has the same mask semantics and is the portable path for
+        # Ascend NPU (and CPU tests).
+        return "ref"
     if backend == "auto":
         if not torch.cuda.is_available():
             return "flex"
@@ -106,8 +122,8 @@ def resolve_softmax_backend(backend: str) -> str:
 
 
 class _Plan:
-    __slots__ = ("dense_q", "win_q", "kv_gather", "cu_q", "cu_k", "max_q", "max_k",
-                 "has_windows")
+    __slots__ = ("dense_q", "win_q", "kv_gather", "cu_q", "cu_k", "cu_q_host",
+                 "cu_k_host", "max_q", "max_k", "has_windows")
 
     def __init__(self, layout: SequenceLayout, bounds, anchor_frames, device):
         S = layout.seq_len
@@ -160,6 +176,10 @@ class _Plan:
             q_lens.append(len(qi)); k_lens.append(len(ki))
 
         self.has_windows = bool(groups)
+        # Host cumulative ends, leading zero included: the NPU varlen backend reads
+        # these instead of syncing an NPU tensor with .tolist() on every block.
+        self.cu_q_host = (0, *itertools.accumulate(q_lens))
+        self.cu_k_host = (0, *itertools.accumulate(k_lens))
         if self.has_windows:
             self.win_q = torch.cat(q_idx)
             self.kv_gather = torch.cat(kv_idx)
@@ -185,6 +205,62 @@ def _plan(layout, bounds, anchor_frames, device):
         while len(_PLAN_CACHE) > MAX_CACHED_PLANS:
             _PLAN_CACHE.pop(next(iter(_PLAN_CACHE)))
     return _PLAN_CACHE[key]
+
+
+def _require_torch_npu():
+    try:
+        import torch_npu
+    except ImportError as exc:
+        raise RuntimeError(
+            "kernels.softmax_backend='npu_varlen' requires torch_npu; install the "
+            "Ascend PyTorch extension for this device"
+        ) from exc
+    npu = getattr(torch, "npu", None)
+    if npu is None or not npu.is_available():
+        raise RuntimeError(
+            "kernels.softmax_backend='npu_varlen' requires an available Ascend NPU"
+        )
+    return torch_npu
+
+
+def window_softmax_npu_varlen(query, key, value, layout, bounds, scale,
+                              anchor_frames="none"):
+    """[T, H, d] q/k/v -> [T, H, d] with the same window mask as the reference, on
+    Ascend NPU: global (and anchor-row) queries run plain SDPA against the full kv, and
+    each window group runs one TND ``npu_fusion_attention`` call over its gathered kv.
+    Groups are processed one at a time so the gather is bounded by the largest group,
+    not the whole sequence. Exact softmax over each query's kept set, but bf16 reduction
+    order differs from ``ref`` -- this is an explicit, non-bitwise opt-in."""
+    if query.device.type != "npu":
+        raise RuntimeError(
+            "window_softmax_npu_varlen requires an NPU tensor; "
+            f"got device {query.device}"
+        )
+    torch_npu = _require_torch_npu()
+
+    plan = _plan(layout, bounds, anchor_frames, query.device)
+    out = torch.empty(query.shape, dtype=query.dtype, device=query.device)
+    if len(plan.dense_q):
+        qd = query[plan.dense_q]
+        od = scaled_dot_product_attention(
+            qd.transpose(0, 1).unsqueeze(0),
+            key.transpose(0, 1).unsqueeze(0),
+            value.transpose(0, 1).unsqueeze(0), scale=scale)
+        out[plan.dense_q] = od[0].transpose(0, 1)
+    if plan.has_windows:
+        for group in range(len(plan.cu_q_host) - 1):
+            q_start, q_end = plan.cu_q_host[group], plan.cu_q_host[group + 1]
+            k_start, k_end = plan.cu_k_host[group], plan.cu_k_host[group + 1]
+            q_index = plan.win_q[q_start:q_end]
+            qw = query[q_index].contiguous()
+            kw = key[plan.kv_gather[k_start:k_end]].contiguous()
+            vw = value[plan.kv_gather[k_start:k_end]].contiguous()
+            out[q_index] = torch_npu.npu_fusion_attention(
+                qw, kw, vw, query.shape[1], "TND", scale=scale,
+                actual_seq_qlen=[q_end - q_start],
+                actual_seq_kvlen=[k_end - k_start],
+                sparse_mode=0)[0]
+    return out
 
 
 def window_softmax_decomposed(query, key, value, layout, bounds, scale,
