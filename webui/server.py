@@ -336,6 +336,11 @@ def validate_submission(
         raise SubmissionError("tp_cache requires tensor_parallel=true")
     if tp_cache and tp_merge_device == "npu":
         raise SubmissionError("tp_cache cannot be combined with tp_merge_device=npu")
+    if tp_cache:
+        cache_path = Path(tp_cache).expanduser()
+        if not cache_path.is_absolute():
+            cache_path = REPO_ROOT / cache_path
+        tp_cache = str(cache_path.resolve())
     if not tensor_parallel and (tp_merge_device != "cpu" or tp_merge_delta_device != "npu"):
         raise SubmissionError("TP merge options require tensor_parallel=true")
     if tensor_parallel:
@@ -855,6 +860,8 @@ class TaskManager:
                 manifest = None
             if self._tp_cache_manifest_usable(manifest, cache_path, checkpoint):
                 return
+        if cache_path.exists() and not cache_path.is_dir():
+            raise RuntimeError(f"TP cache path is not a directory: {cache_path}")
         force = cache_path.exists() and any(cache_path.iterdir())
         command = [sys.executable, "-u", "-m", "src.inference.prepare_tp_cache",
                    "--out", str(cache_path)]
