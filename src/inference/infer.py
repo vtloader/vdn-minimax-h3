@@ -41,7 +41,7 @@ def main():
     model = build_inference_model(cfg, device)
     prompt_embeds, text_token_tags, conditions = load_prompt(cfg.render.prompt_file, device)
     if conditions:
-        print(f"{conditioning_mode(conditions[0])}: keyframes anchored {conditions[0]}", flush=True)
+        print(f"{conditioning_mode(conditions.anchors)}: keyframes anchored {conditions.anchors}", flush=True)
 
     if cfg.render.warmup_steps:
         report_progress("warmup")

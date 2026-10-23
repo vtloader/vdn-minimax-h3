@@ -28,7 +28,7 @@
               <option value="t2va">t2va · 文本生成</option>
               <option value="i2va">i2va · 首帧生成</option>
               <option value="fl2va">fl2va · 首尾帧生成</option>
-              <option value="ref2va">ref2va · 参考图生成</option>
+              <option value="ref2va">ref2va · 参考图/视频/音频生成</option>
             </select>
           </div>
 
@@ -49,10 +49,24 @@
               <label for="refs">参考图片</label>
               <input id="refs" name="refs" type="file" multiple accept="image/png,image/jpeg,image/webp,image/bmp">
               <button id="clear-refs" class="secondary-button" type="button" aria-label="清除所有参考图片" disabled>清除图片</button>
-              <small>按上传顺序对应 Picture 1、Picture 2…，最多 16 张。</small>
+              <small>按上传顺序对应 Picture 1、Picture 2…，最多 9 张。</small>
               <div id="refs-preview" class="upload-previews" aria-live="polite"></div>
             </div>
-            <small>PNG、JPEG、WebP 或 BMP；单张不超过 20 MiB，单次请求不超过 80 MiB。</small>
+            <div id="video_refs-field" class="upload-field hidden">
+              <label for="video_refs">参考视频</label>
+              <input id="video_refs" name="video_refs" type="file" multiple accept="video/mp4,video/quicktime,video/webm,video/x-matroska">
+              <button id="clear-video_refs" class="secondary-button" type="button" aria-label="清除所有参考视频" disabled>清除视频</button>
+              <small>仅 Ref2VA 使用，最多 3 个；顺序对应 Video 1、Video 2…；单个最大 256 MiB。视频自带音轨会作为该视频的参考音频。</small>
+              <div id="video_refs-preview" class="upload-previews" aria-live="polite"></div>
+            </div>
+            <div id="audio_refs-field" class="upload-field hidden">
+              <label for="audio_refs">参考音频</label>
+              <input id="audio_refs" name="audio_refs" type="file" multiple accept="audio/wav,audio/mpeg,audio/mp4,audio/aac,audio/flac,audio/ogg,audio/opus">
+              <button id="clear-audio_refs" class="secondary-button" type="button" aria-label="清除所有参考音频" disabled>清除音频</button>
+              <small>仅 Ref2VA 使用，最多 3 个；顺序对应 Audio 1、Audio 2…；单个最大 64 MiB。音频必须和至少一张参考图或一个参考视频一起使用。</small>
+              <div id="audio_refs-preview" class="upload-previews" aria-live="polite"></div>
+            </div>
+            <small>图片 20 MiB、视频 256 MiB、音频 64 MiB；单次请求不超过 512 MiB。</small>
             <p id="mode-hint" class="muted"></p>
           </section>
         </div>

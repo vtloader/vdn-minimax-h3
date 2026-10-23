@@ -20,7 +20,7 @@ from src.inference.utils.prompt_cache import is_reference_request
 from src.inference.geometry import EXPORT_FPS, export_frame_count, validate_canvas
 from src.models.sequence_layout import layout_from_indices
 from src.models.hybrid_transform import iter_hybrids, set_layout
-from src.utils.device import autocast, generator, synchronize
+from src.utils.device import autocast, empty_cache, generator, synchronize
 
 # The production canvas, 768x1344, through the 16x spatial VAE.
 LATENT_H, LATENT_W = 48, 84
@@ -61,7 +61,23 @@ def generate_latents(transformer, prompt_embeds, text_token_tags, num_frames, nu
             "use at least 22 frames (the valid 17*n+5 geometry)"
         )
     num_audio_latents = audio_latent_num_frames(num_frames)
-    anchors, condition_latents = conditions if conditions else ((), [])
+    if conditions:
+        if isinstance(conditions, (tuple, list)):
+            # Legacy keyframe cache shape: (anchors, condition_latents).
+            anchors, condition_latents = conditions
+            audio_condition_latents = []
+            reference_kinds = ("image",) * len(anchors)
+            reference_has_audio = (False,) * len(anchors)
+        else:
+            anchors = conditions.anchors
+            condition_latents = conditions.condition_latents
+            audio_condition_latents = conditions.audio_condition_latents
+            reference_kinds = conditions.kinds
+            reference_has_audio = conditions.has_audio
+    else:
+        anchors, condition_latents = (), []
+        audio_condition_latents = []
+        reference_kinds = reference_has_audio = ()
     if width is not None or height is not None:
         validate_canvas(width if width is not None else LATENT_W * 16,
                         height if height is not None else LATENT_H * 16)
@@ -79,17 +95,20 @@ def generate_latents(transformer, prompt_embeds, text_token_tags, num_frames, nu
     if is_reference_request(anchors):
         # The layout step reads a reference's modality only (`kind`, `has_audio`); the
         # geometry comes from the latents.
-        references = [SimpleNamespace(kind="image", has_audio=False) for _ in anchors]
+        references = [SimpleNamespace(kind=kind, has_audio=has_audio)
+                      for kind, has_audio in zip(reference_kinds, reference_has_audio)]
         layout = MiniMaxH3Ref2VAPrepareLayoutStep.build_ref2va_packed_sequence(
-            text_token_tags, references, condition_latents, [], num_latent_frames, latent_h,
-            latent_w, num_audio_latents, patch, AUDIO_CHANNELS, AUDIO_TAG, VIDEO_TAG,
+            text_token_tags, references, condition_latents, audio_condition_latents,
+            num_latent_frames, latent_h, latent_w, num_audio_latents, patch,
+            AUDIO_CHANNELS, AUDIO_TAG, VIDEO_TAG,
         )
     else:
         layout = MiniMaxH3PrepareLayoutStep.build_packed_sequence(
             text_token_tags, num_latent_frames, latent_h, latent_w, num_audio_latents,
             patch, AUDIO_CHANNELS, AUDIO_TAG, VIDEO_TAG, keyframe_anchors=anchors,
         )
-    position_ids, token_tags, video_indices, audio_indices, text_indices, num_condition_rows, _ = layout
+    (position_ids, token_tags, video_indices, audio_indices, text_indices,
+     num_condition_rows, num_condition_audio_rows) = layout
     position_ids, token_tags = position_ids.to(device), token_tags.to(device)
     video_indices, audio_indices, text_indices = (
         video_indices.to(device), audio_indices.to(device), text_indices.to(device),
@@ -130,8 +149,17 @@ def generate_latents(transformer, prompt_embeds, text_token_tags, num_frames, nu
         if video_rows.shape[0] != video_indices.numel():
             raise ValueError(f"{video_rows.shape[0]} video rows (with conditioning) != "
                              f"{video_indices.numel()} layout rows")
-    audio_rows = torch.randn((num_audio_latents * AUDIO_CHANNELS, 32),
-                             generator=noise_generator, device=device, dtype=torch.float32)
+    target_audio_rows = torch.randn((num_audio_latents * AUDIO_CHANNELS, 32),
+                                    generator=noise_generator, device=device, dtype=torch.float32)
+    if audio_condition_latents:
+        reference_audio_rows = torch.cat(
+            [rows.to(device=device, dtype=torch.float32) for rows in audio_condition_latents])
+        audio_rows = torch.cat([reference_audio_rows, target_audio_rows])
+    else:
+        audio_rows = target_audio_rows
+    if audio_rows.shape[0] != audio_indices.numel():
+        raise ValueError(f"{audio_rows.shape[0]} audio rows (with references) != "
+                         f"{audio_indices.numel()} layout rows")
 
     if runtime is not None:
         runtime.barrier()
@@ -140,10 +168,16 @@ def generate_latents(transformer, prompt_embeds, text_token_tags, num_frames, nu
     seq_len = position_ids.shape[0]
     for step, (t, audio_t) in enumerate(zip(scheduler.timesteps, audio_scheduler.timesteps), 1):
         step_started = time.perf_counter()
+        # Prefetch/offload leaves device blocks in the allocator cache between
+        # steps. Return them before the next full-sequence forward; the ref2va
+        # video block doubles the packed sequence and makes fragmentation fatal.
+        empty_cache(device)
         row_timesteps = torch.full((seq_len,), float(t), dtype=torch.float32, device=device)
         if num_condition_rows:
             row_timesteps[video_indices[:num_condition_rows]] = max(float(t), KEYFRAME_NOISE_AUG)
-        row_timesteps[audio_indices] = float(audio_t)
+        if num_condition_audio_rows:
+            row_timesteps[audio_indices[:num_condition_audio_rows]] = 1.0
+        row_timesteps[audio_indices[num_condition_audio_rows:]] = float(audio_t)
         timestep, timestep_indices = torch.unique(row_timesteps, sorted=True, return_inverse=True)
         noise_pred, audio_noise_pred = transformer(
             hidden_states=video_rows[None],
@@ -162,7 +196,9 @@ def generate_latents(transformer, prompt_embeds, text_token_tags, num_frames, nu
         video_rows[num_condition_rows:] = scheduler.step(
             noise_pred[0, num_condition_rows:].float(), t, video_rows[num_condition_rows:],
             return_dict=False)[0]
-        audio_rows = audio_scheduler.step(audio_noise_pred[0].float(), audio_t, audio_rows, return_dict=False)[0]
+        audio_rows[num_condition_audio_rows:] = audio_scheduler.step(
+            audio_noise_pred[0, num_condition_audio_rows:].float(), audio_t,
+            audio_rows[num_condition_audio_rows:], return_dict=False)[0]
 
         if step_seconds is not None or progress_callback is not None:
             synchronize(device)
@@ -178,6 +214,7 @@ def generate_latents(transformer, prompt_embeds, text_token_tags, num_frames, nu
 
     # Unpatchify (the AfterDenoise step's reshape) and unpack the channel-major audio rows.
     video_rows = video_rows[num_condition_rows:]
+    audio_rows = audio_rows[num_condition_audio_rows:]
     rows = video_rows.reshape(-1, num_latent_frames, frame_h, frame_w, channels, *patch)
     rows = rows.permute(0, 4, 1, 5, 2, 6, 3, 7)
     latents = rows.reshape(-1, channels, num_latent_frames, latent_h, latent_w).contiguous()

@@ -28,7 +28,7 @@ We present some samples of generated videos here:
 
 - **October 2, 2026:** [FreeVideo](https://github.com/FlashML-org/FreeVideo), built on VDN-H3, runs MiniMax H3 on consumer GPUs with as little as 8 GB of VRAM.
 - **September 17, 2026:** The [Video DeltaNet paper](https://arxiv.org/abs/2609.20744) is available on arXiv.
-- **September 17, 2026:** We support the [Ref2VA-like](#supporting-ref2va-like-task) task now with the same checkpoint: reference images through the FL2VA weights.
+- **September 17, 2026:** We support the [Ref2VA-like](#supporting-ref2va-like-task) task now with the same checkpoint: reference images, videos and audio through the FL2VA weights.
 - **September 14, 2026:** [SGLang Diffusion](https://github.com/sgl-project/sglang) now supports VDN-H3, achieving its fastest reported performance: 6.9 seconds for denoising and about 9.0 seconds end-to-end for a 14.4-second video on 8×B200 GPUs. See the [MiniMax-H3 cookbook](https://github.com/sgl-project/sglang/blob/main/docs/cookbook/diffusion/MiniMax/MiniMax-H3.mdx#7-vdn-h3-hybrid-attention-8-step-distill) for more details.
 - **September 8, 2026:** We support I2VA, FL2VA and L2VA now with the same checkpoint.
 - **September 6, 2026:** We released the [VDN-H3 blog](https://openvdn.github.io/), [training and inference code](https://github.com/OpenVDN/vdn-minimax-h3), and [model weights](https://huggingface.co/OpenVDN/vdn-minimax-h3).
@@ -268,7 +268,7 @@ torchrun --standalone --nproc_per_node=8 src/inference/infer_ulysses.py \
 
 #### Supporting Ref2VA-Like Task
 
-The MiniMax-H3 FL2VA checkpoints have zero-shot ability to take reference images and perform the way the MiniMax-H3 Ref2VA checkpoints generate videos. Each reference image appears in the prompt as a `<Picture i>` entry and is accompanied by its own block of conditioning rows placed before the video tokens.
+The MiniMax-H3 FL2VA checkpoints have zero-shot ability to take reference images, videos and audio clips and perform the way the MiniMax-H3 Ref2VA checkpoints generate videos. Each visual reference appears in the prompt as a `<Picture i>` or `<Video k>` entry and is accompanied by its own block of conditioning rows before the video tokens; audio clips appear as `<Audio j>` and contribute their own soundtrack rows. The WebUI accepts up to 9 images, 3 videos and 3 audio clips (audio needs at least one image or video).
 
 Generation still uses the FL2VA weights rather than MiniMax-H3's separate Ref2VA transformer, which is why we describe this mode as Ref2VA-like rather than Ref2VA proper.
 

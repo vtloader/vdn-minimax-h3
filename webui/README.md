@@ -37,11 +37,14 @@ HOST=127.0.0.1 PORT=8080 bash scripts/launch_webui.sh
 | `t2va` | None | `encode_prompt.py` |
 | `i2va` | One first image | `encode_keyframes.py --first` |
 | `fl2va` | One first and one last image | `encode_keyframes.py --first --last` |
-| `ref2va` | 1–16 reference images | `encode_keyframes.py --refs` |
+| `ref2va` | up to 9 images, 3 videos, 3 audio clips (audio needs an image/video) | `encode_keyframes.py --refs/--video_refs/--audio_refs` |
 
-Reference upload order is kept, matching `<Picture 1>`, `<Picture 2>`, and so on in the
-prompt. Selecting more reference pictures appends to the current list instead of
-replacing it; use **清除图片** to start over. First/last images remain single-value. Ref2VA-like generation uses the existing FL2VA transformer and checkpoints.
+Reference upload order is kept, matching `<Picture 1>`, `<Picture 2>`, `<Video 1>`,
+`<Audio 1>`, and so on in the prompt. Images, videos and audio are packed in that
+modality order. Selecting more references appends instead of replacing; every preview
+has **替换** and **删除** buttons, and **清除图片/视频/音频** clears a whole group.
+First/last images remain single-value. Ref2VA-like generation uses the existing FL2VA
+transformer and checkpoints.
 For image modes, follow the [prompt-writing instructions](../README.md#supporting-fl2va-i2va-and-l2va).
 Prompts are passed verbatim and are limited to 20,000 characters.
 
@@ -49,8 +52,10 @@ The page keeps the current prompt, all form settings, and the selected reference
 in the browser (sessionStorage for fields, IndexedDB for images), so going to the task
 log and coming back restores the form instead of starting over. Uploads support PNG,
 JPEG, WebP, and BMP with basic file signature validation. The
-encoder performs full image decoding. Each image is limited to 20 MiB and the entire
-multipart request to 80 MiB. Ordinary names, spaces, and Unicode names are preserved;
+encoder performs full media decoding. Images are limited to 20 MiB each, videos to
+256 MiB, audio to 64 MiB, and the entire multipart request to 512 MiB. Video/audio
+references need PyAV; audio resampling also needs `torchaudio` (install the build that
+matches your PyTorch). Ordinary names, spaces, and Unicode names are preserved;
 path components and unsafe characters are sanitized. Name collisions get numeric
 suffixes such as `image_2.png`.
 

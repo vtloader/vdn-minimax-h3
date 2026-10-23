@@ -1,0 +1,35 @@
+# VDN-H3 / MiniMax-H3 inference and WebUI dependencies (Ascend NPU reference).
+#
+# The device stack is tied to the installed CANN release. Install the matching
+# PyTorch + torch_npu wheels from the Ascend/CANN wheel source before this file;
+# the pins below record the versions validated in this workspace.
+#
+#   torch 2.7.1 (CPU build) + torch_npu 2.7.1.post4 + CANN 9.1.0
+#
+# The patched diffusers tree is vendored at ./diffusers and must be installed
+# editable first (see scripts/setup_diffusers.sh).
+torch==2.7.1
+torch-npu==2.7.1.post4
+torchvision==0.22.1
+torchaudio==2.7.1
+
+-e ./diffusers
+
+transformers==5.15.0
+accelerate==1.14.0
+peft==0.20.0
+safetensors==0.8.0
+huggingface-hub==1.33.0
+omegaconf==2.3.1
+PyYAML==6.0.3
+einops==0.8.2
+numpy==1.26.4
+pillow==12.3.0
+av==18.1.0
+tqdm==4.70.1
+requests==2.34.2
+
+# Optional CUDA-only acceleration stack (not used on Ascend):
+#   triton==3.7.1
+#   flash-attn-4==4.0.0b26
+#   torchao==0.18.0

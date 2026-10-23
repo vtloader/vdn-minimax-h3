@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import atexit
 import copy
+import os
 import time
 import weakref
 from types import MethodType
@@ -180,19 +181,38 @@ class _PrefetchScheduler:
 
         before = _host_stats(self.backend)
         started = time.perf_counter()
-        # Both ranks pin their own 36 GiB backing at the same time. The host guard
-        # above already required 1.5x the combined backing plus 8 GiB free, so the
-        # two copies fit; pinning them concurrently halves the cold-start pin wall.
-        dist.barrier()
-        error = None
-        try:
-            self._pin_local_backing()
-        except BaseException as exc:
-            error = f"rank {rank}: {type(exc).__name__}: {exc}"
-        pin_errors = [None, None]
-        dist.all_gather_object(pin_errors, error)
-        dist.barrier()
-        if any(pin_errors):
+        pin_errors = []
+        # Two ranks growing the TorchNPU host allocator at once has been observed
+        # to SIGSEGV on some CANN builds. Serialize the pin by default; the
+        # concurrent pin is still available as an explicit opt-in for hosts that
+        # have been validated.
+        parallel_pin = os.environ.get("VDN_TP_PREFETCH_PARALLEL_PIN") == "1"
+        if parallel_pin:
+            dist.barrier()
+            error = None
+            try:
+                self._pin_local_backing()
+            except BaseException as exc:
+                error = f"rank {rank}: {type(exc).__name__}: {exc}"
+            pin_errors = [None, None]
+            dist.all_gather_object(pin_errors, error)
+            dist.barrier()
+        else:
+            for owner in range(world):
+                dist.barrier()
+                error = None
+                if rank == owner:
+                    try:
+                        self._pin_local_backing()
+                    except BaseException as exc:
+                        error = f"rank {rank}: {type(exc).__name__}: {exc}"
+                owner_errors = [None, None]
+                dist.all_gather_object(owner_errors, error)
+                dist.barrier()
+                pin_errors.extend(item for item in owner_errors if item)
+                if pin_errors:
+                    break
+        if pin_errors:
             self._restore_cpu_bindings_after_setup_failure()
             raise RuntimeError("TP prefetch backing pin failed: "
                                + "; ".join(item for item in pin_errors if item))

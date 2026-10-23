@@ -80,6 +80,7 @@
 
   const form = document.getElementById("task-form");
   if (!form) return;
+  form.noValidate = true;
   const mode = document.getElementById("mode");
   const device = document.getElementById("device");
   const offload = document.getElementById("offload");
@@ -251,14 +252,16 @@
   updateSampling();
   updateResolution();
 
-  const uploads = ["first", "last", "refs"].map((name) => ({
+  const uploads = ["first", "last", "refs", "video_refs", "audio_refs"].map((name) => ({
     name, input: document.getElementById(name),
     preview: document.getElementById(`${name}-preview`),
     clear: document.getElementById(`clear-${name}`), entries: [], files: [],
+    replaceIndex: null,
   }));
+  const accumulatingUploads = new Set(["refs", "video_refs", "audio_refs"]);
 
-  function syncAccumulatedFiles(upload) {
-    if (upload.name !== "refs" || typeof DataTransfer === "undefined") return;
+  function syncUploadFiles(upload) {
+    if (typeof DataTransfer === "undefined") return;
     const transfer = new DataTransfer();
     for (const file of upload.files) transfer.items.add(file);
     upload.input.files = transfer.files;
@@ -267,7 +270,7 @@
   function releasePreviews(upload) {
     for (const entry of upload.entries) {
       entry.active = false;
-      entry.image.removeAttribute("src");
+      entry.media.removeAttribute("src");
       URL.revokeObjectURL(entry.url);
     }
     upload.entries = [];
@@ -279,34 +282,70 @@
     const files = upload.files;
     upload.clear.disabled = files.length === 0;
     files.forEach((file, index) => {
-      const label = upload.name === "refs" ? `Picture ${index + 1}` : (upload.name === "first" ? "首帧" : "尾帧");
+      const label = upload.name === "refs" ? `Picture ${index + 1}`
+        : upload.name === "video_refs" ? `Video ${index + 1}`
+        : upload.name === "audio_refs" ? `Audio ${index + 1}`
+        : upload.name === "first" ? "首帧" : "尾帧";
       const figure = document.createElement("figure");
       figure.className = "upload-preview";
       const frame = document.createElement("div");
       frame.className = "preview-image-frame";
-      const image = document.createElement("img");
-      image.alt = `${label}图片预览：${file.name}`;
+      const media = document.createElement(upload.name === "video_refs" ? "video"
+        : upload.name === "audio_refs" ? "audio" : "img");
+      if (media.tagName === "IMG") media.alt = `${label}图片预览：${file.name}`;
+      else { media.controls = true; media.preload = "metadata"; }
       const caption = document.createElement("figcaption");
       const filename = document.createElement("strong");
       filename.textContent = `${label} · ${file.name}`;
       const dimensions = document.createElement("small");
-      dimensions.textContent = "正在读取图片尺寸…";
-      frame.append(image);
-      caption.append(filename, dimensions);
+      dimensions.textContent = upload.name === "audio_refs" ? "正在读取音频信息…" : "正在读取媒体信息…";
+      const actions = document.createElement("div");
+      actions.className = "upload-actions";
+      const replace = document.createElement("button");
+      replace.type = "button"; replace.className = "secondary-button"; replace.textContent = "替换";
+      replace.addEventListener("click", () => {
+        upload.replaceIndex = index;
+        upload.input.value = "";
+        upload.input.click();
+      });
+      const remove = document.createElement("button");
+      remove.type = "button"; remove.className = "secondary-button"; remove.textContent = "删除";
+      remove.addEventListener("click", () => {
+        upload.files.splice(index, 1);
+        syncUploadFiles(upload);
+        renderPreviews(upload);
+        void persistUploads();
+      });
+      actions.append(replace, remove);
+      frame.append(media);
+      caption.append(filename, dimensions, actions);
       figure.append(frame, caption);
       upload.preview.append(figure);
       try {
-        const entry = { image, url: URL.createObjectURL(file), active: true };
+        const entry = { media, url: URL.createObjectURL(file), active: true };
         upload.entries.push(entry);
-        image.addEventListener("load", () => {
-          if (entry.active) dimensions.textContent = `${image.naturalWidth} × ${image.naturalHeight} 像素`;
+        const loaded = () => {
+          if (!entry.active) return;
+          if (media.tagName === "IMG") {
+            dimensions.textContent = `${media.naturalWidth} × ${media.naturalHeight} 像素`;
+          } else if (media.tagName === "VIDEO") {
+            dimensions.textContent = `${media.videoWidth} × ${media.videoHeight} · ${Number(media.duration || 0).toFixed(1)}s`;
+          } else {
+            dimensions.textContent = `时长 ${Number(media.duration || 0).toFixed(1)}s`;
+          }
+        };
+        media.addEventListener("load", loaded);
+        media.addEventListener("loadedmetadata", loaded);
+        media.addEventListener("error", () => {
+          if (entry.active) {
+            dimensions.textContent = media.tagName === "IMG"
+              ? "无法读取图片，请检查文件格式。"
+              : "无法读取媒体，请检查文件格式。";
+          }
         });
-        image.addEventListener("error", () => {
-          if (entry.active) dimensions.textContent = "无法读取图片，请检查文件格式。";
-        });
-        image.src = entry.url;
+        media.src = entry.url;
       } catch (_) {
-        dimensions.textContent = "当前浏览器无法预览此图片。";
+        dimensions.textContent = "当前浏览器无法预览此文件。";
       }
     });
   }
@@ -314,14 +353,25 @@
   for (const upload of uploads) {
     upload.input.addEventListener("change", () => {
       const selected = Array.from(upload.input.files);
-      upload.files = upload.name === "refs" ? upload.files.concat(selected) : selected;
-      if (upload.name === "refs") syncAccumulatedFiles(upload);
+      if (upload.replaceIndex !== null) {
+        if (selected.length) upload.files[upload.replaceIndex] = selected[0];
+        upload.replaceIndex = null;
+        upload.input.value = "";
+        syncUploadFiles(upload);
+        renderPreviews(upload);
+        void persistUploads();
+        return;
+      }
+      upload.files = accumulatingUploads.has(upload.name)
+        ? upload.files.concat(selected) : selected;
+      syncUploadFiles(upload);
       renderPreviews(upload);
       void persistUploads();
     });
     upload.clear.addEventListener("click", () => {
       upload.input.value = "";
       upload.files = [];
+      upload.replaceIndex = null;
       renderPreviews(upload);
       void persistUploads();
     });
@@ -334,17 +384,23 @@
 
   function updateModeFields() {
     const selected = mode.value;
-    const visible = {first: ["i2va", "fl2va"].includes(selected), last: selected === "fl2va", refs: selected === "ref2va"};
+    const visible = {
+      first: ["i2va", "fl2va"].includes(selected),
+      last: selected === "fl2va",
+      refs: selected === "ref2va",
+      video_refs: selected === "ref2va",
+      audio_refs: selected === "ref2va",
+    };
     for (const [name, show] of Object.entries(visible)) {
       document.getElementById(`${name}-field`).classList.toggle("hidden", !show);
       const input = document.getElementById(name);
       input.disabled = !show;
-      input.required = show;
+      input.required = show && (name === "first" || name === "last");
     }
     document.getElementById("image-fields").classList.toggle("hidden", selected === "t2va");
     const hint = document.getElementById("mode-hint");
     hint.textContent = selected === "ref2va"
-      ? "使用现有 FL2VA 权重，请在提示词中用 <Picture 1>、<Picture 2> 等引用参考图。"
+      ? "使用现有 FL2VA 权重；参考图/视频/音频按顺序对应 <Picture 1>、<Picture 2>… / <Video 1>… / <Audio 1>…。至少需要一张参考图或一个参考视频。"
       : "首尾帧会等比裁剪至所选分辨率，预览保留原图。提示词首行需包含对应模式指令。";
   }
 
@@ -466,7 +522,7 @@
       const records = Array.isArray(payload[upload.name]) ? payload[upload.name] : [];
       upload.files = records.map((record) => new File([record.blob], record.name,
         { type: record.type, lastModified: record.lastModified }));
-      syncAccumulatedFiles(upload);
+      syncUploadFiles(upload);
       renderPreviews(upload);
     }
     uploadsRestored = true;
@@ -608,6 +664,17 @@
       const configError = updateConfig();
       if (configError) throw new Error(configError);
       updateModeFields();
+      if (!document.getElementById("prompt").value.trim()) {
+        throw new Error("请输入提示词。");
+      }
+      if (mode.value === "i2va" && !uploads.find((u) => u.name === "first").files.length) {
+        throw new Error("i2va 需要上传一张首帧图片。");
+      }
+      if (mode.value === "fl2va") {
+        const first = uploads.find((u) => u.name === "first").files.length;
+        const last = uploads.find((u) => u.name === "last").files.length;
+        if (!first || !last) throw new Error("fl2va 需要同时上传首帧和尾帧图片。");
+      }
       const body = new FormData(form);
       body.set("offload", String(offload.checked));
       body.set("npu_resident_blocks", residentBlocks.value || "0");
@@ -618,16 +685,29 @@
       body.set("tp_merge_device", tpMergeDevice.value || "cpu");
       body.set("tp_merge_delta_device", tpMergeDelta.value || "npu");
       body.set("optimized_cuda", String(optimized.checked));
+      const limits = {
+        first: 20 * 1024 * 1024, last: 20 * 1024 * 1024, refs: 20 * 1024 * 1024,
+        video_refs: 256 * 1024 * 1024, audio_refs: 64 * 1024 * 1024,
+      };
       for (const upload of uploads) {
         if (upload.input.disabled) continue;
         for (const file of upload.files) {
-          if (file.size > 20 * 1024 * 1024) throw new Error(`${file.name} 超过单张 20 MiB 的限制。`);
+          if (file.size > limits[upload.name]) {
+            throw new Error(`${file.name} 超过 ${Math.round(limits[upload.name] / 1024 / 1024)} MiB 的限制。`);
+          }
         }
       }
-      body.delete("refs");
-      const refs = uploads.find((upload) => upload.name === "refs");
-      if (!refs.input.disabled) {
-        for (const file of refs.files) body.append("refs", file, file.name);
+      const mediaRefs = uploads.filter((upload) => accumulatingUploads.has(upload.name));
+      if (mode.value === "ref2va") {
+        const visual = mediaRefs
+          .filter((upload) => upload.name === "refs" || upload.name === "video_refs")
+          .reduce((total, upload) => total + upload.files.length, 0);
+        if (!visual) throw new Error("Ref2VA 至少需要一张参考图或一个参考视频。");
+      }
+      for (const upload of mediaRefs) {
+        body.delete(upload.name);
+        if (upload.input.disabled) continue;
+        for (const file of upload.files) body.append(upload.name, file, file.name);
       }
       let response;
       try {
@@ -644,12 +724,15 @@
       if (!response.ok) throw new Error(`提交失败：${data.error || `HTTP ${response.status}`}`);
       if (!data.id) throw new Error("提交失败：服务未返回任务编号。");
       saveFormState();
-      await persistUploads();
+      void persistUploads();
       window.location.href = `/logs/${encodeURIComponent(data.id)}`;
     } catch (exc) {
       error.textContent = exc.message;
       submit.disabled = false;
       submit.textContent = "开始生成";
+      if (typeof error.scrollIntoView === "function") {
+        error.scrollIntoView({ block: "center", behavior: "smooth" });
+      }
     }
   });
 

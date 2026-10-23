@@ -50,12 +50,19 @@ STATIC_ROOT = WEBUI_ROOT / "static"
 RUNS_DIR = Path(os.environ.get("WEBUI_RUNS_DIR", str(WEBUI_ROOT / "runs"))).resolve()
 
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
-MAX_TOTAL_REQUEST_BYTES = 80 * 1024 * 1024
+MAX_VIDEO_BYTES = 256 * 1024 * 1024
+MAX_AUDIO_BYTES = 64 * 1024 * 1024
+MAX_TOTAL_REQUEST_BYTES = 512 * 1024 * 1024
 MAX_PROMPT_LENGTH = 20_000
-MAX_REFERENCE_IMAGES = 16
+MAX_REFERENCE_IMAGES = 9
+MAX_REFERENCE_VIDEOS = 3
+MAX_REFERENCE_AUDIOS = 3
+MAX_REFERENCE_TOTAL = 12
 MAX_FRAMES = 4096
 MAX_STEPS = 100
 ALLOWED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+ALLOWED_VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
+ALLOWED_AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus"}
 TASK_ID_PATTERN = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{8}$")
 DEVICE_PATTERN = re.compile(r"^(?:npu|cuda):[0-9]+$")
 ACTIVE_STATUSES = {"queued", "running"}
@@ -170,31 +177,55 @@ def _safe_filename(filename: str) -> str:
 
 
 def _validate_uploads(uploads: Mapping[str, list[UploadedFile]]) -> None:
-    for files in uploads.values():
+    for field, files in uploads.items():
         for uploaded in files:
             safe_name = _safe_filename(uploaded.filename)
-            if Path(safe_name).suffix.lower() not in ALLOWED_IMAGE_SUFFIXES:
-                allowed = ", ".join(sorted(ALLOWED_IMAGE_SUFFIXES))
-                raise SubmissionError(f"{uploaded.filename!r} is not a supported image ({allowed})")
-            if not uploaded.content:
-                raise SubmissionError(f"uploaded image {uploaded.filename!r} is empty")
-            if len(uploaded.content) > MAX_IMAGE_BYTES:
-                raise SubmissionError(
-                    f"uploaded image {uploaded.filename!r} exceeds the 20 MiB limit"
-                )
-            # Basic content checks without importing Pillow or the model dependencies.
-            # The existing encoder performs full image decoding before loading the VLM.
-            data = uploaded.content
             suffix = Path(safe_name).suffix.lower()
-            valid_header = {
-                ".png": data.startswith(b"\x89PNG\r\n\x1a\n"),
-                ".jpg": data.startswith(b"\xff\xd8\xff"),
-                ".jpeg": data.startswith(b"\xff\xd8\xff"),
-                ".webp": data.startswith(b"RIFF") and data[8:12] == b"WEBP",
-                ".bmp": data.startswith(b"BM"),
-            }
-            if not valid_header[suffix]:
-                raise SubmissionError(f"{uploaded.filename!r} has invalid image content")
+            data = uploaded.content
+            if not data:
+                raise SubmissionError(f"uploaded file {uploaded.filename!r} is empty")
+            if field in {"first", "last", "refs"}:
+                if suffix not in ALLOWED_IMAGE_SUFFIXES:
+                    allowed = ", ".join(sorted(ALLOWED_IMAGE_SUFFIXES))
+                    raise SubmissionError(
+                        f"{uploaded.filename!r} is not a supported image ({allowed})")
+                if len(data) > MAX_IMAGE_BYTES:
+                    raise SubmissionError(
+                        f"uploaded image {uploaded.filename!r} exceeds the 20 MiB limit")
+                valid_header = {
+                    ".png": data.startswith(b"\x89PNG\r\n\x1a\n"),
+                    ".jpg": data.startswith(b"\xff\xd8\xff"),
+                    ".jpeg": data.startswith(b"\xff\xd8\xff"),
+                    ".webp": data.startswith(b"RIFF") and data[8:12] == b"WEBP",
+                    ".bmp": data.startswith(b"BM"),
+                }
+                if not valid_header[suffix]:
+                    raise SubmissionError(f"{uploaded.filename!r} has invalid image content")
+            elif field == "video_refs":
+                if suffix not in ALLOWED_VIDEO_SUFFIXES:
+                    allowed = ", ".join(sorted(ALLOWED_VIDEO_SUFFIXES))
+                    raise SubmissionError(
+                        f"{uploaded.filename!r} is not a supported video ({allowed})")
+                if len(data) > MAX_VIDEO_BYTES:
+                    raise SubmissionError(
+                        f"uploaded video {uploaded.filename!r} exceeds the 256 MiB limit")
+                valid = (data[4:8] == b"ftyp" or data.startswith(b"\x1aE\xdf\xa3")
+                         or (data.startswith(b"RIFF") and data[8:12] == b"AVI "))
+                if not valid:
+                    raise SubmissionError(f"{uploaded.filename!r} has invalid video content")
+            elif field == "audio_refs":
+                if suffix not in ALLOWED_AUDIO_SUFFIXES:
+                    allowed = ", ".join(sorted(ALLOWED_AUDIO_SUFFIXES))
+                    raise SubmissionError(
+                        f"{uploaded.filename!r} is not a supported audio file ({allowed})")
+                if len(data) > MAX_AUDIO_BYTES:
+                    raise SubmissionError(
+                        f"uploaded audio {uploaded.filename!r} exceeds the 64 MiB limit")
+                valid = (data.startswith((b"RIFF", b"ID3", b"fLaC", b"OggS"))
+                         or data[4:8] == b"ftyp"
+                         or (len(data) >= 2 and data[0] == 0xFF and data[1] & 0xF0 == 0xF0))
+                if not valid:
+                    raise SubmissionError(f"{uploaded.filename!r} has invalid audio content")
 
 
 def validate_submission(
@@ -269,12 +300,15 @@ def validate_submission(
             snapshot = REPO_ROOT / snapshot
         model_root = str(snapshot.resolve())
 
-    if any(name not in {"first", "last", "refs", "refs[]"} for name in uploads):
-        raise SubmissionError("unknown image upload field")
+    if any(name not in {"first", "last", "refs", "refs[]", "video_refs", "audio_refs"}
+           for name in uploads):
+        raise SubmissionError("unknown upload field")
     normalized_uploads: dict[str, list[UploadedFile]] = {
         "first": list(uploads.get("first", [])),
         "last": list(uploads.get("last", [])),
         "refs": list(uploads.get("refs", [])) + list(uploads.get("refs[]", [])),
+        "video_refs": list(uploads.get("video_refs", [])),
+        "audio_refs": list(uploads.get("audio_refs", [])),
     }
     _validate_uploads(normalized_uploads)
 
@@ -283,21 +317,32 @@ def validate_submission(
             raise SubmissionError("t2va does not accept image uploads")
     elif mode == "i2va":
         if len(normalized_uploads["first"]) != 1 or any(
-            normalized_uploads[name] for name in ("last", "refs")
+            normalized_uploads[name] for name in ("last", "refs", "video_refs", "audio_refs")
         ):
             raise SubmissionError("i2va requires exactly one first image")
     elif mode == "fl2va":
         if len(normalized_uploads["first"]) != 1 or len(normalized_uploads["last"]) != 1:
             raise SubmissionError("fl2va requires exactly one first and one last image")
-        if normalized_uploads["refs"]:
-            raise SubmissionError("fl2va does not accept reference images")
+        if any(normalized_uploads[name] for name in ("refs", "video_refs", "audio_refs")):
+            raise SubmissionError("fl2va does not accept reference media")
     elif mode == "ref2va":
-        if not 1 <= len(normalized_uploads["refs"]) <= MAX_REFERENCE_IMAGES:
-            raise SubmissionError(
-                f"ref2va requires between 1 and {MAX_REFERENCE_IMAGES} reference images"
-            )
         if normalized_uploads["first"] or normalized_uploads["last"]:
-            raise SubmissionError("ref2va accepts reference images through the refs field")
+            raise SubmissionError("ref2va accepts references through the refs/video_refs/audio_refs fields")
+        images = len(normalized_uploads["refs"])
+        videos = len(normalized_uploads["video_refs"])
+        audios = len(normalized_uploads["audio_refs"])
+        if images > MAX_REFERENCE_IMAGES:
+            raise SubmissionError(f"ref2va accepts at most {MAX_REFERENCE_IMAGES} reference images")
+        if videos > MAX_REFERENCE_VIDEOS:
+            raise SubmissionError(f"ref2va accepts at most {MAX_REFERENCE_VIDEOS} reference videos")
+        if audios > MAX_REFERENCE_AUDIOS:
+            raise SubmissionError(f"ref2va accepts at most {MAX_REFERENCE_AUDIOS} reference audio clips")
+        if images + videos + audios > MAX_REFERENCE_TOTAL:
+            raise SubmissionError(f"ref2va accepts at most {MAX_REFERENCE_TOTAL} references in total")
+        if images + videos == 0:
+            raise SubmissionError("ref2va needs at least one image or video reference")
+        if audios and images + videos == 0:
+            raise SubmissionError("audio references need an image or video reference")
 
     offload = _parse_checkbox(fields, "offload", device.startswith("npu:"))
     optimized_cuda = _parse_checkbox(fields, "optimized_cuda", False)
@@ -448,8 +493,16 @@ def build_commands(task: Mapping[str, object], run_dir: Path) -> list[list[str]]
                 ["--first", str(input_paths["first"][0]), "--last", str(input_paths["last"][0])]
             )
         elif mode == "ref2va":
-            encoder.append("--refs")
-            encoder.extend(str(path) for path in input_paths["refs"])
+            if input_paths["refs"]:
+                encoder.append("--refs")
+                encoder.extend(str(path) for path in input_paths["refs"])
+            if input_paths.get("video_refs"):
+                encoder.append("--video_refs")
+                encoder.extend(str(path) for path in input_paths["video_refs"])
+            if input_paths.get("audio_refs"):
+                encoder.append("--audio_refs")
+                encoder.extend(str(path) for path in input_paths["audio_refs"])
+            encoder.extend(["--num_frames", str(task["frames"])])
 
     config = inference_config_path(task)
     tensor_parallel = bool(task.get("tensor_parallel"))
@@ -672,9 +725,10 @@ class TaskManager:
             input_dir.mkdir(parents=True, exist_ok=False)
             (run_dir / "prompt.txt").write_text(submission.prompt, encoding="utf-8")
 
-            input_paths: dict[str, list[str]] = {"first": [], "last": [], "refs": []}
+            input_paths: dict[str, list[str]] = {
+                "first": [], "last": [], "refs": [], "video_refs": [], "audio_refs": []}
             input_files: list[str] = []
-            for field in ("first", "last", "refs"):
+            for field in ("first", "last", "refs", "video_refs", "audio_refs"):
                 for uploaded in submission.uploads[field]:
                     filename = _safe_filename(uploaded.filename)
                     destination = _unique_path(input_dir, filename)
@@ -805,10 +859,11 @@ class TaskManager:
     def _prompt_key(self, task: Mapping[str, object]) -> str:
         digest = hashlib.sha256()
         for value in (task.get("mode"), task.get("prompt"), task.get("model_root"),
-                      task.get("device"), task.get("width"), task.get("height")):
+                      task.get("device"), task.get("width"), task.get("height"),
+                      task.get("frames")):
             digest.update(str(value or "").encode("utf-8", errors="replace"))
             digest.update(b"\0")
-        for field in ("first", "last", "refs"):
+        for field in ("first", "last", "refs", "video_refs", "audio_refs"):
             paths = (task.get("input_paths") or {}).get(field) or []
             for path in paths:
                 digest.update(field.encode("ascii"))

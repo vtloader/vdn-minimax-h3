@@ -19,6 +19,7 @@ from src.inference.render import decode_and_save, generate_latents
 from src.inference.utils import assemble
 from src.inference.utils.assemble import build_inference_model, render_record, write_json
 from src.inference.utils.base_shard import build_base_shard_model
+from src.inference.utils.chunked_ff import install_chunked_feed_forward
 from src.inference.utils.prompt_cache import load_prompt
 from src.inference.utils.tensor_parallel import (TensorParallelRuntime, install_tensor_parallel,
                                                  prepare_tensor_parallel, storage_bytes,
@@ -157,6 +158,7 @@ def _run(cfg, runtime, started):
     device = runtime.device
     offload = cfg.render.offload_dit
     offload_manager = None
+    install_chunked_feed_forward()
 
     def progress(stage, **fields):
         if runtime.is_main:

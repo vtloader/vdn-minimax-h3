@@ -9,7 +9,7 @@ How the repository's own stack renders: the entry points, the configs, the kerne
 | [src/inference/infer.py](../src/inference/infer.py) | one GPU |
 | [src/inference/infer_ulysses.py](../src/inference/infer_ulysses.py) | eight GPUs under `torchrun`, sequence parallel |
 | [src/inference/encode_prompt.py](../src/inference/encode_prompt.py) | a text prompt to a prompt cache (`.pt`) |
-| [src/inference/encode_keyframes.py](../src/inference/encode_keyframes.py) | a prompt plus keyframes (`--first`, `--last`) or reference images (`--refs`) to a prompt cache |
+| [src/inference/encode_keyframes.py](../src/inference/encode_keyframes.py) | a prompt plus keyframes (`--first`, `--last`), reference images (`--refs`), or ref2va videos/audio (`--video_refs`, `--audio_refs`) to a prompt cache |
 | [src/inference/infer_diffusers.py](../src/inference/infer_diffusers.py) | the published diffusers component; shares no code with the two above |
 
 Encoding is separate from rendering because the Qwen3-VL text encoder is 63 GB: a prompt is encoded once, and every render reuses the cache without loading the encoder.
@@ -247,7 +247,7 @@ A prompt cache is one `.pt` holding the prompt text, the Qwen3-VL hidden state a
 | I2VA, L2VA, FL2VA | `encode_keyframes.py --first` and/or `--last` | `[text, keyframes, audio, video]` |
 | Ref2VA-like | `encode_keyframes.py --refs a.png b.png ...` | `[text, one block per reference, audio, video]` |
 
-Keyframes go onto the video canvas: the first is stretched to it and the last is cover-cropped. References keep their own aspect ratio on a 768-pixel short edge (`--ref_size`), and each takes its own rotary slot ahead of the video. Every image appears twice: as a `<Picture i>` vision block in the text, and as conditioning rows that are noised to t = 0.999 and held there while only the generated rows are stepped. On the hybrid model the conditioning rows are global tokens, attended densely in both directions by the window softmax and absent from the linear scan.
+Keyframes go onto the video canvas: the first is stretched to it and the last is cover-cropped. Image references keep their own aspect ratio on a 768-pixel short edge (`--ref_size`), videos are normalized to 24 fps on their own canvas, and audio clips are resampled through the audio VAE. Visual references take their own rotary slots ahead of the video; video soundtracks and audio clips add clean audio rows at t = 1.0. Images and videos appear as `<Picture i>` / `<Video k>` vision blocks in the text; audio is labelled `<Audio j>` and never reaches the conditioner. On the hybrid model the conditioning rows are global tokens, attended densely in both directions by the window softmax and absent from the linear scan.
 
 Conditioning rows lengthen the sequence. A T2VA render is about 104k audio and video rows plus the text. The Samoyed reference example adds 6,948 text and 5,664 reference rows, and runs at 19.1 seconds per evaluation on one H200 in fp8 and 3.4 on eight.
 

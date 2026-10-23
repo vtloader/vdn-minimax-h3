@@ -45,8 +45,12 @@ from PIL import Image
 from PIL import ImageOps
 from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 
-from diffusers import AutoencoderKLMiniMaxH3
-from diffusers.modular_pipelines.minimax_h3.encoders import encode_vae_condition
+from diffusers import AutoencoderKLMiniMaxH3, AutoencoderKLMiniMaxH3Audio
+from diffusers.modular_pipelines.minimax_h3.before_encoder import MiniMaxH3Ref2VASetupStep
+from diffusers.modular_pipelines.minimax_h3.encoders import (
+    MiniMaxH3Ref2VATextEncoderStep, encode_vae_condition)
+from diffusers.modular_pipelines.minimax_h3.references import (
+    MiniMaxH3AudioReference, MiniMaxH3ImageReference, MiniMaxH3VideoReference)
 from diffusers.modular_pipelines.minimax_h3.modular_pipeline import resolve_canvas_size
 
 from src.inference.render import PIXEL_MEAN, PIXEL_STD
@@ -181,6 +185,121 @@ def check_instruction(prompt, anchors):
     return mode
 
 
+def encode_mixed_references(args, device, model_root):
+    """Encode a ref2va request containing images, videos and/or audio clips."""
+    num_frames = int(args.num_frames)
+    if num_frames < 22 or (num_frames - 5) % 17:
+        raise ValueError(f"ref2va num_frames must be 17*n+5, got {num_frames}")
+    if args.width is not None:
+        width, height = args.width, args.height
+    else:
+        height, width = resolve_canvas_size(16, 9, CANVAS_MULTIPLE, CANVAS_SHORT_EDGE,
+                                            CANVAS_MAX_PIXELS)
+
+    references, files, kinds = [], [], []
+    for path in args.refs or []:
+        image = normalize_references([Image.open(path)], args.ref_size)[0]
+        references.append(MiniMaxH3ImageReference(image=image))
+        files.append(path); kinds.append("image")
+    for path in args.video_refs or []:
+        raw = MiniMaxH3VideoReference.from_file(path)
+        frames = MiniMaxH3Ref2VASetupStep._normalize_video_condition(
+            raw.frames, raw.fps, num_frames, CANVAS_MULTIPLE, CANVAS_SHORT_EDGE,
+            CANVAS_MAX_PIXELS, 24.0)
+        references.append(MiniMaxH3VideoReference(
+            frames=frames, fps=24.0, audio=raw.audio, sample_rate=raw.sample_rate))
+        files.append(path); kinds.append("video")
+    for path in args.audio_refs or []:
+        audio = MiniMaxH3AudioReference.from_file(path)
+        references.append(audio)
+        files.append(path); kinds.append("audio")
+
+    print(f"ref2va: canvas {width}x{height}; references {kinds}", flush=True)
+    print(f"Loading processor from {model_root}", flush=True)
+    processor = Qwen3VLProcessor.from_pretrained(model_root, subfolder="processor")
+    text_step = MiniMaxH3Ref2VATextEncoderStep()
+    vision_inputs, image_counts, video_counts, video_timestamps = (
+        text_step._gather_vision_features(processor, references, 24.0))
+    token_ids, token_tags = text_step._build_presentation(
+        processor.tokenizer, args.prompt, references, image_counts, video_counts,
+        video_timestamps, text_tag=TEXT_TAG, video_tag=VIDEO_TAG)
+
+    print(f"Loading text encoder ({'CPU leaf offload' if args.offload else device})", flush=True)
+    text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+        model_root, subfolder="text_encoder", dtype=torch.bfloat16)
+    text_encoder.eval().requires_grad_(False)
+    if args.offload:
+        from diffusers.hooks import apply_group_offloading
+        apply_group_offloading(
+            text_encoder.model, onload_device=device, offload_device="cpu",
+            offload_type="leaf_level", use_stream=False)
+    else:
+        text_encoder.to(device)
+    print(f"Encoding {len(token_ids)} text/vision tokens on {device}", flush=True)
+    prompt_embeds = qwen3vl_prompt_embeds(text_encoder, processor, token_ids, vision_inputs, device)
+    del text_encoder
+    gc.collect()
+    empty_cache(device)
+
+    print(f"Loading VAE from {args.vae_root} on {device}", flush=True)
+    vae = AutoencoderKLMiniMaxH3.from_pretrained(
+        resolve_weights(args.vae_root), subfolder="vae").to(device).eval()
+    needs_audio = any(reference.has_audio for reference in references)
+    audio_vae = None
+    if needs_audio:
+        audio_vae = AutoencoderKLMiniMaxH3Audio.from_pretrained(
+            resolve_weights(args.vae_root), subfolder="audio_vae").to(device).eval()
+        audio_sr = int(audio_vae.config.sampling_rate)
+        audio_mean = torch.tensor(audio_vae.config.latents_mean).view(1, 1, -1)
+        audio_std = torch.tensor(audio_vae.config.latents_std).view(1, 1, -1)
+        max_duration = num_frames / 24.0
+
+    condition_latents, audio_condition_latents = [], []
+    with torch.no_grad():
+        for reference in references:
+            if reference.kind == "image":
+                pixels = torch.from_numpy(np.array(reference.image)).to(device)
+                pixels = pixels.permute(2, 0, 1)[None, :, None]
+                condition_latents.append(encode_vae_condition(
+                    vae, pixels, PIXEL_MEAN, PIXEL_STD, KEYFRAME_ENCODE_SEED))
+            elif reference.kind == "video":
+                frames = reference.frames[:num_frames]
+                chunk = int(vae.config.clip_length)
+                latents_chunk = int(vae.tokens_chunk_size)
+                count = max(1, (frames.shape[0] - latents_chunk) // chunk) * chunk + latents_chunk
+                frames = frames[:count]
+                pixels = torch.from_numpy(frames.copy()).to(device).permute(3, 0, 1, 2)[None]
+                condition_latents.append(encode_vae_condition(
+                    vae, pixels, PIXEL_MEAN, PIXEL_STD, KEYFRAME_ENCODE_SEED))
+
+            if not reference.has_audio:
+                continue
+            waveform = MiniMaxH3Ref2VASetupStep._normalize_audio_condition(
+                reference.audio, reference.sample_rate or audio_sr, audio_sr, max_duration)
+            posterior = audio_vae.encode(waveform.to(device)[:, None], return_dict=False)[0]
+            latents = posterior.mode().float().cpu().transpose(1, 2)
+            normalized = (latents - audio_mean) / audio_std
+            audio_condition_latents.append(
+                normalized.reshape(-1, audio_vae.config.latent_channels))
+
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    return {
+        "prompt": args.prompt,
+        "prompt_embeds": prompt_embeds,
+        "text_token_tags": torch.tensor(token_tags, dtype=torch.long),
+        "keyframe_anchors": [REFERENCE_ANCHOR] * len(references),
+        "keyframe_files": files,
+        "reference_kinds": kinds,
+        "reference_has_audio": [reference.has_audio for reference in references],
+        "condition_latents": condition_latents,
+        "audio_condition_latents": audio_condition_latents,
+        "height": height,
+        "width": width,
+        "reference_size": args.ref_size,
+        "num_frames": num_frames,
+    }
+
+
 def main():
     p = argparse.ArgumentParser(description="Cache Qwen3-VL and VAE conditioning for keyframes or references.")
     p.add_argument("--prompt", type=str, required=True)
@@ -190,7 +309,13 @@ def main():
                    help="reference images in the order the prompt numbers them "
                         "(<Picture 1>, <Picture 2>, ...); a ref2va-like request")
     p.add_argument("--ref_size", type=int, default=REFERENCE_SHORT_EDGE,
-                    help="short edge every reference is put on")
+                    help="short edge every image reference is put on")
+    p.add_argument("--video_refs", type=str, nargs="+", metavar="VIDEO",
+                   help="reference videos in packed order, after images")
+    p.add_argument("--audio_refs", type=str, nargs="+", metavar="AUDIO",
+                   help="reference audio clips in packed order, after videos")
+    p.add_argument("--num_frames", type=int, default=345,
+                   help="generated frame count; reference video/audio are truncated to this duration")
     p.add_argument("--width", type=int, default=None,
                    help="explicit output canvas width, paired with --height; multiples of 32")
     p.add_argument("--height", type=int, default=None,
@@ -211,7 +336,12 @@ def main():
             validate_canvas(args.width, args.height)
         except ValueError as exc:
             p.error(str(exc))
-    if bool(args.refs) == bool(args.first or args.last):
+    mixed = bool(args.video_refs or args.audio_refs)
+    if mixed and (args.first or args.last):
+        p.error("--video_refs/--audio_refs are ref2va-only and cannot be combined with keyframes")
+    if mixed and not (args.refs or args.video_refs):
+        p.error("ref2va needs at least one image or video reference; audio cannot stand alone")
+    if not mixed and bool(args.refs) == bool(args.first or args.last):
         p.error("pass --first and/or --last, or --refs (a request with neither is t2va: "
                  "use encode_prompt.py)")
     device = device_of(args.device)
@@ -219,6 +349,14 @@ def main():
     if args.model_root is None:
         print("Resolving processor and text encoder snapshot", flush=True)
         args.model_root = upstream_snapshot("processor", "text_encoder")
+
+    if mixed:
+        cache = encode_mixed_references(args, device, args.model_root)
+        torch.save(cache, args.out)
+        print(f"wrote {args.out}: {cache['text_token_tags'].numel()} tokens, "
+              f"{len(cache['condition_latents'])} visual and "
+              f"{len(cache['audio_condition_latents'])} audio reference(s)", flush=True)
+        return
 
     if args.refs:
         pairs = [(REFERENCE_ANCHOR, path) for path in args.refs]
