@@ -332,6 +332,13 @@ def _run(cfg, runtime, started):
             decode_and_save(video, audio, model.vae, model.audio_vae, cfg.render.out, str(device), cfg.render.fps)
             synchronize(device)
         runtime.barrier()
+        # A persistent worker outlives this request. Drop the decoded workspace
+        # and return the VAE/decode allocator cache before the next request; a
+        # following prompt encoder runs in a separate process on the same NPU.
+        del video, audio
+        gc.collect()
+        empty_cache(device)
+        runtime.barrier()
         decode_seconds = time.perf_counter() - decode_started
         memory_phases["decode_and_encode"] = allocator_peaks(device)
         local["allocator_peaks_by_phase"] = memory_phases

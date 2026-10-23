@@ -1143,6 +1143,14 @@ class TaskManager:
                 if self.dry_run:
                     self._run_dry_stage(task_id, commands[0], "encoding")
                 else:
+                    # The persistent worker keeps its NPU 0 context and cached
+                    # decode blocks alive. A new prompt encoder is a separate
+                    # process on the same device, so release the idle worker
+                    # first; it is restarted after encoding.
+                    self._append_log(
+                        task_id,
+                        "[webui] stopping idle TP worker before prompt encoding")
+                    self._stop_tp_worker()
                     self._execute(task_id, commands[0])
                 if not prompt_path.is_file():
                     raise RuntimeError("encoder completed without creating prompt.pt")
